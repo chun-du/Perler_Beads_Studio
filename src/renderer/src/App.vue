@@ -1,15 +1,26 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
-import type { AiListModelsResult } from '@shared/ai'
+import type { AiImageOptimizationRequest, AiImageOptimizationResult, AiListModelsResult } from '@shared/ai'
+import { buildAiImageEditsUrl, buildAiModelsUrl, createAiImageOptimizationPrompt } from '@shared/ai'
+import type { SavedProject } from '@shared/project'
 import type { ThemePreference } from '@shared/theme'
 import { useTheme } from './composables/useTheme'
-import { beadPalette, aiProviderPresets, workflowSteps } from './data/studio'
 import {
+  defaultManufacturerId,
+  getManufacturerPalette,
+  manufacturerPalettes
+} from './data/palettes'
+import { aiProviderPresets, workflowSteps } from './data/studio'
+import {
+  buildBeadInventory,
   createPatternFromImageFile,
+  createPatternFromImageDataUrl,
   createSamplePattern,
+  exportBeadInventoryAsCsv,
   exportPatternAsPng,
-  parseBoardSize
+  parseBoardSize,
+  readImageFileAsDataUrl
 } from './utils/pattern'
 import type { PatternGrid } from './utils/pattern'
 
@@ -17,7 +28,6 @@ type EditorTool = 'pencil' | 'fill' | 'eyedropper' | 'eraser'
 
 const { preference, resolvedTheme, setPreference, cycleTheme } = useTheme()
 
-const manufacturers = ['Perler', 'Hama', 'Artkal', 'Nabbi', '自定义色卡']
 const boardSizes = ['32 x 32', '48 x 48', '64 x 64', '96 x 96']
 const optimizationModes = ['主体增强', '去背景', '像素画参考', '低色数简化']
 const editorTools: Array<{ id: EditorTool; icon: string; label: string }> = [
@@ -27,25 +37,36 @@ const editorTools: Array<{ id: EditorTool; icon: string; label: string }> = [
   { id: 'eraser', icon: 'ri:eraser-line', label: '橡皮' }
 ]
 
-const selectedManufacturer = ref(manufacturers[0])
+const selectedManufacturer = ref(defaultManufacturerId)
 const selectedBoardSize = ref(boardSizes[1])
 const maxColors = ref(24)
 const enableDithering = ref(true)
+const showGridLabels = ref(true)
+const activeManufacturerPalette = computed(() => getManufacturerPalette(selectedManufacturer.value))
+const activePaletteColors = computed(() => activeManufacturerPalette.value.colors)
 const createCurrentSamplePattern = (): PatternGrid => {
   const { columns, rows } = parseBoardSize(selectedBoardSize.value)
-  return createSamplePattern(beadPalette, columns, rows)
+  return createSamplePattern(activePaletteColors.value, columns, rows)
 }
 const patternGrid = ref<PatternGrid>(createCurrentSamplePattern())
 const sourceFile = ref<File | null>(null)
 const isGenerating = ref(false)
+const isOptimizingImage = ref(false)
 const hasManualEdits = ref(false)
 const generationMessage = ref('示例图纸已就绪')
 const generationError = ref('')
-const selectedColorHex = ref(beadPalette[3].hex)
+const aiOptimizeStatus = ref('')
+const aiOptimizeError = ref('')
+const aiReferenceDataUrl = ref('')
+const aiReferenceName = ref('')
+const selectedColorHex = ref(activePaletteColors.value[3]?.hex ?? activePaletteColors.value[0].hex)
 const activeTool = ref<EditorTool>('pencil')
 const undoStack = ref<string[][]>([])
 const redoStack = ref<string[][]>([])
+const projectFileInput = ref<HTMLInputElement | null>(null)
+const projectStatus = ref('尚未保存')
 let generationToken = 0
+let isApplyingProject = false
 
 const selectedProviderId = ref(aiProviderPresets[0].id)
 const baseUrl = ref(aiProviderPresets[0].baseUrl)
@@ -64,6 +85,21 @@ const selectedProvider = computed(() => {
 const previewColumns = computed(() => patternGrid.value.columns)
 const previewRows = computed(() => patternGrid.value.rows)
 const beadCells = computed(() => patternGrid.value.cells)
+const shouldShowGridLabel = (value: number, maxValue: number): boolean => {
+  return value === 1 || value === maxValue || value % 5 === 0
+}
+const columnLabels = computed(() =>
+  Array.from({ length: previewColumns.value }, (_item, index) => {
+    const value = index + 1
+    return shouldShowGridLabel(value, previewColumns.value) ? String(value) : ''
+  })
+)
+const rowLabels = computed(() =>
+  Array.from({ length: previewRows.value }, (_item, index) => {
+    const value = index + 1
+    return shouldShowGridLabel(value, previewRows.value) ? String(value) : ''
+  })
+)
 const patternStatus = computed(() => {
   if (isGenerating.value) return '生成中'
   if (generationError.value) return '需处理'
@@ -71,22 +107,13 @@ const patternStatus = computed(() => {
   return sourceFile.value ? '已生成' : '草稿'
 })
 
-const usedColors = computed(() => {
-  const usedSet = new Set(beadCells.value)
-  return beadPalette.filter((color) => usedSet.has(color.hex))
-})
+const beadInventory = computed(() => buildBeadInventory(patternGrid.value, activePaletteColors.value))
+const usedColors = computed(() => beadInventory.value)
 
-const displayedColors = computed(() => usedColors.value.slice(0, 9))
-
-const beadCountByColor = computed(() => {
-  return beadCells.value.reduce<Record<string, number>>((countMap, color) => {
-    countMap[color] = (countMap[color] ?? 0) + 1
-    return countMap
-  }, {})
-})
+const displayedColors = computed(() => beadInventory.value.slice(0, 9))
 
 const selectedColor = computed(() => {
-  return beadPalette.find((color) => color.hex === selectedColorHex.value) ?? beadPalette[0]
+  return activePaletteColors.value.find((color) => color.hex === selectedColorHex.value) ?? activePaletteColors.value[0]
 })
 
 const themeOptions: Array<{ value: ThemePreference; icon: string; label: string }> = [
@@ -108,15 +135,242 @@ const onProviderChange = (): void => {
   modelError.value = ''
 }
 
-const buildModelsUrl = (providerBaseUrl: string): string => {
-  const url = new URL(providerBaseUrl.trim())
-  const trimmedPath = url.pathname.replace(/\/+$/, '')
-  url.pathname = trimmedPath.endsWith('/models') ? trimmedPath : `${trimmedPath}/models`
-  return url.toString()
+const getPatternGenerationOptions = () => ({
+  boardSize: selectedBoardSize.value,
+  maxColors: maxColors.value,
+  dithering: enableDithering.value,
+  palette: activePaletteColors.value
+})
+
+const getDisplayFileName = (filePath: string): string => {
+  return filePath.split(/[\\/]/).pop() ?? filePath
+}
+
+const isSavedProjectPayload = (value: unknown): value is SavedProject => {
+  if (typeof value !== 'object' || value === null) return false
+
+  const project = value as Partial<SavedProject>
+  return (
+    project.schemaVersion === 1 &&
+    project.appName === 'Perler Beads Studio' &&
+    typeof project.pattern?.columns === 'number' &&
+    typeof project.pattern?.rows === 'number' &&
+    Array.isArray(project.pattern?.cells) &&
+    project.pattern.cells.length === project.pattern.columns * project.pattern.rows
+  )
+}
+
+const buildSavedProject = (): SavedProject => {
+  return {
+    schemaVersion: 1,
+    appName: 'Perler Beads Studio',
+    savedAt: new Date().toISOString(),
+    board: {
+      manufacturer: activeManufacturerPalette.value.id,
+      boardSize: selectedBoardSize.value,
+      maxColors: maxColors.value,
+      dithering: enableDithering.value,
+      showLabels: showGridLabels.value
+    },
+    pattern: {
+      columns: patternGrid.value.columns,
+      rows: patternGrid.value.rows,
+      cells: [...patternGrid.value.cells],
+      sourceName: patternGrid.value.sourceName
+    },
+    ai: {
+      providerId: selectedProviderId.value,
+      baseUrl: baseUrl.value,
+      modelId: selectedModel.value,
+      optimizationMode: selectedMode.value
+    }
+  }
+}
+
+const applySavedProject = (project: SavedProject, displayName: string): void => {
+  isApplyingProject = true
+  selectedManufacturer.value = getManufacturerPalette(project.board.manufacturer).id
+  selectedBoardSize.value = project.board.boardSize
+  maxColors.value = project.board.maxColors
+  enableDithering.value = project.board.dithering
+  showGridLabels.value = project.board.showLabels
+  patternGrid.value = {
+    columns: project.pattern.columns,
+    rows: project.pattern.rows,
+    cells: [...project.pattern.cells],
+    sourceName: project.pattern.sourceName
+  }
+  selectedProviderId.value = project.ai.providerId
+  baseUrl.value = project.ai.baseUrl
+  selectedMode.value = project.ai.optimizationMode
+
+  if (!modelOptions.value.includes(project.ai.modelId)) {
+    modelOptions.value = [project.ai.modelId, ...modelOptions.value]
+  }
+
+  selectedModel.value = project.ai.modelId
+  sourceFile.value = null
+  aiReferenceDataUrl.value = ''
+  aiReferenceName.value = ''
+  aiOptimizeStatus.value = ''
+  aiOptimizeError.value = ''
+  hasManualEdits.value = false
+  undoStack.value = []
+  redoStack.value = []
+  generationError.value = ''
+  generationMessage.value = `已打开 ${displayName}`
+  projectStatus.value = `已打开 ${displayName}`
+  window.setTimeout(() => {
+    isApplyingProject = false
+  }, 0)
+}
+
+const downloadProjectFile = (project: SavedProject): void => {
+  const blob = new Blob([`${JSON.stringify(project, null, 2)}\n`], { type: 'application/json' })
+  const link = document.createElement('a')
+  link.download = `perler-pattern-${project.pattern.columns}x${project.pattern.rows}.pbd.json`
+  link.href = URL.createObjectURL(blob)
+  link.click()
+  URL.revokeObjectURL(link.href)
+}
+
+const saveProject = async (): Promise<void> => {
+  const project = buildSavedProject()
+
+  if (window.perler?.project) {
+    const result = await window.perler.project.saveProject({ project })
+
+    if (result.canceled) return
+
+    if (!result.ok) {
+      generationError.value = result.error ?? '保存失败'
+      return
+    }
+
+    const displayName = result.filePath ? getDisplayFileName(result.filePath) : '项目文件'
+    projectStatus.value = `已保存 ${displayName}`
+    generationMessage.value = `已保存 ${displayName}`
+    hasManualEdits.value = false
+    return
+  }
+
+  downloadProjectFile(project)
+  projectStatus.value = '已下载项目文件'
+  generationMessage.value = '已下载项目文件'
+  hasManualEdits.value = false
+}
+
+const openProject = async (): Promise<void> => {
+  if (window.perler?.project) {
+    const result = await window.perler.project.openProject()
+
+    if (result.canceled) return
+
+    if (!result.ok || !result.project) {
+      generationError.value = result.error ?? '打开失败'
+      return
+    }
+
+    applySavedProject(result.project, result.filePath ? getDisplayFileName(result.filePath) : '项目文件')
+    return
+  }
+
+  projectFileInput.value?.click()
+}
+
+const onProjectFileSelected = async (event: Event): Promise<void> => {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+
+  if (!file) return
+
+  try {
+    const payload = JSON.parse(await file.text()) as unknown
+
+    if (!isSavedProjectPayload(payload)) {
+      generationError.value = '项目文件格式不正确'
+      return
+    }
+
+    applySavedProject(payload, file.name)
+  } catch (error) {
+    generationError.value = error instanceof Error ? error.message : '打开失败'
+  } finally {
+    input.value = ''
+  }
+}
+
+const isLocalWebPreview = (): boolean => {
+  return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(window.location.hostname)
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === 'object' && value !== null
+}
+
+const parseJsonResponse = async (response: Response): Promise<unknown> => {
+  try {
+    return (await response.json()) as unknown
+  } catch {
+    return null
+  }
+}
+
+const getApiErrorMessage = (payload: unknown): string | undefined => {
+  if (!isRecord(payload)) return undefined
+  if (isRecord(payload.error) && typeof payload.error.message === 'string') {
+    return payload.error.message
+  }
+  if (typeof payload.message === 'string') {
+    return payload.message
+  }
+  return undefined
+}
+
+const getFirstImageResult = (
+  payload: unknown
+): { b64Json?: string; url?: string; revisedPrompt?: string } | null => {
+  if (!isRecord(payload) || !Array.isArray(payload.data)) return null
+
+  for (const item of payload.data) {
+    if (!isRecord(item)) continue
+
+    const b64Json = typeof item.b64_json === 'string' ? item.b64_json : undefined
+    const url = typeof item.url === 'string' ? item.url : undefined
+    const revisedPrompt = typeof item.revised_prompt === 'string' ? item.revised_prompt : undefined
+
+    if (b64Json || url) {
+      return { b64Json, url, revisedPrompt }
+    }
+  }
+
+  return null
+}
+
+const readBlobAsDataUrl = async (blob: Blob): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(new Error('图片结果读取失败'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+const readRemoteImageAsDataUrlInBrowser = async (url: string): Promise<string> => {
+  if (url.startsWith('data:image/')) return url
+
+  const response = await fetch(url)
+
+  if (!response.ok) {
+    throw new Error(`图片下载失败: HTTP ${response.status}`)
+  }
+
+  return readBlobAsDataUrl(await response.blob())
 }
 
 const listModelsInBrowser = async (): Promise<AiListModelsResult> => {
-  const response = await fetch(buildModelsUrl(baseUrl.value), {
+  const response = await fetch(buildAiModelsUrl(baseUrl.value), {
     headers: {
       Authorization: `Bearer ${apiKey.value}`,
       Accept: 'application/json'
@@ -137,6 +391,65 @@ const listModelsInBrowser = async (): Promise<AiListModelsResult> => {
       payload.data
         ?.filter((model) => typeof model.id === 'string' && model.id.length > 0)
         .map((model) => ({ id: model.id as string, created: model.created, ownedBy: model.owned_by })) ?? []
+  }
+}
+
+const optimizeImageInBrowser = async (
+  imageFile: File,
+  request: AiImageOptimizationRequest
+): Promise<AiImageOptimizationResult> => {
+  if (!isLocalWebPreview()) {
+    return { ok: false, error: 'Web 预览 AI 直连仅限本地开发地址' }
+  }
+
+  const body = new FormData()
+
+  body.append('model', request.model.trim())
+  body.append('prompt', createAiImageOptimizationPrompt(request.optimizationMode))
+  body.append('image', imageFile, imageFile.name)
+
+  try {
+    const response = await fetch(buildAiImageEditsUrl(request.baseUrl), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${request.apiKey}`,
+        Accept: 'application/json'
+      },
+      body
+    })
+    const payload = await parseJsonResponse(response)
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: getApiErrorMessage(payload) ?? `AI 优化失败: HTTP ${response.status}`
+      }
+    }
+
+    const imageResult = getFirstImageResult(payload)
+
+    if (!imageResult) {
+      return { ok: false, error: 'AI 接口未返回图片结果' }
+    }
+
+    const imageDataUrl = imageResult.b64Json
+      ? imageResult.b64Json.startsWith('data:image/')
+        ? imageResult.b64Json
+        : `data:image/png;base64,${imageResult.b64Json}`
+      : await readRemoteImageAsDataUrlInBrowser(imageResult.url as string)
+
+    return {
+      ok: true,
+      imageDataUrl,
+      revisedPrompt: imageResult.revisedPrompt
+    }
+  } catch (error) {
+    if (error instanceof TypeError) {
+      return { ok: false, error: 'Web 预览直连失败，可能是接口未开启 CORS 或网络不可达' }
+    }
+
+    const message = error instanceof Error ? error.message : 'AI 优化失败'
+    return { ok: false, error: message }
   }
 }
 
@@ -181,8 +494,86 @@ const fetchModels = async (): Promise<void> => {
   }
 }
 
+const optimizeImageWithAi = async (): Promise<void> => {
+  const imageFile = sourceFile.value
+
+  aiOptimizeError.value = ''
+  aiOptimizeStatus.value = ''
+  generationError.value = ''
+
+  if (!imageFile) {
+    aiOptimizeError.value = '请先导入原图'
+    return
+  }
+
+  if (!baseUrl.value.trim()) {
+    aiOptimizeError.value = '请先填写 Base URL'
+    return
+  }
+
+  if (!apiKey.value.trim()) {
+    aiOptimizeError.value = '请先填写 API Key'
+    return
+  }
+
+  if (!selectedModel.value.trim()) {
+    aiOptimizeError.value = '请先选择模型'
+    return
+  }
+
+  isOptimizingImage.value = true
+  const runtimeLabel = window.perler?.ai ? '桌面端' : 'Web 预览'
+  generationMessage.value = `正在通过${runtimeLabel}调用 AI 优化原图`
+  aiOptimizeStatus.value = window.perler?.ai
+    ? '正在优化原图'
+    : 'Web 预览直连中，API Key 仅用于本次请求'
+
+  try {
+    const imageDataUrl = await readImageFileAsDataUrl(imageFile)
+    const request: AiImageOptimizationRequest = {
+      baseUrl: baseUrl.value,
+      apiKey: apiKey.value,
+      model: selectedModel.value,
+      optimizationMode: selectedMode.value,
+      imageDataUrl,
+      imageName: imageFile.name
+    }
+    const result = window.perler?.ai
+      ? await window.perler.ai.optimizeImage(request)
+      : await optimizeImageInBrowser(imageFile, request)
+
+    if (!result.ok || !result.imageDataUrl) {
+      aiOptimizeError.value = result.error ?? 'AI 优化失败'
+      generationError.value = aiOptimizeError.value
+      return
+    }
+
+    aiReferenceDataUrl.value = result.imageDataUrl
+    aiReferenceName.value = `AI 优化 · ${imageFile.name}`
+
+    const nextPattern = await createPatternFromImageDataUrl(
+      result.imageDataUrl,
+      aiReferenceName.value,
+      getPatternGenerationOptions()
+    )
+
+    patternGrid.value = nextPattern
+    hasManualEdits.value = false
+    undoStack.value = []
+    redoStack.value = []
+    generationMessage.value = '已从 AI 优化图生成图纸'
+    aiOptimizeStatus.value = result.revisedPrompt ? 'AI 优化完成，已应用模型修订提示' : 'AI 优化完成'
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'AI 优化失败'
+    aiOptimizeError.value = message
+    generationError.value = message
+  } finally {
+    isOptimizingImage.value = false
+  }
+}
+
 const regeneratePattern = async (): Promise<void> => {
-  if (!sourceFile.value) return
+  if (!sourceFile.value && !aiReferenceDataUrl.value) return
 
   const token = (generationToken += 1)
   isGenerating.value = true
@@ -190,12 +581,13 @@ const regeneratePattern = async (): Promise<void> => {
   generationMessage.value = '正在转换图片'
 
   try {
-    const nextPattern = await createPatternFromImageFile(sourceFile.value, {
-      boardSize: selectedBoardSize.value,
-      maxColors: maxColors.value,
-      dithering: enableDithering.value,
-      palette: beadPalette
-    })
+    const nextPattern = aiReferenceDataUrl.value
+      ? await createPatternFromImageDataUrl(
+          aiReferenceDataUrl.value,
+          aiReferenceName.value || 'AI 优化参考图',
+          getPatternGenerationOptions()
+        )
+      : await createPatternFromImageFile(sourceFile.value as File, getPatternGenerationOptions())
 
     if (token !== generationToken) return
 
@@ -222,11 +614,27 @@ const onImageSelected = async (event: Event): Promise<void> => {
   if (!file) return
 
   sourceFile.value = file
+  aiReferenceDataUrl.value = ''
+  aiReferenceName.value = ''
+  aiOptimizeStatus.value = ''
+  aiOptimizeError.value = ''
   await regeneratePattern()
   input.value = ''
 }
 
-watch([selectedBoardSize, maxColors, enableDithering], () => {
+watch([selectedManufacturer, selectedBoardSize, maxColors, enableDithering], () => {
+  if (isApplyingProject) return
+
+  const paletteColors = activePaletteColors.value
+
+  if (maxColors.value > paletteColors.length) {
+    maxColors.value = paletteColors.length
+  }
+
+  if (!paletteColors.some((color) => color.hex === selectedColorHex.value)) {
+    selectedColorHex.value = paletteColors[3]?.hex ?? paletteColors[0].hex
+  }
+
   if (sourceFile.value) {
     void regeneratePattern()
   } else {
@@ -303,7 +711,7 @@ const onCellClick = (index: number): void => {
   }
 
   if (activeTool.value === 'eraser') {
-    replaceCell(index, beadPalette[0].hex)
+    replaceCell(index, activePaletteColors.value[0].hex)
     return
   }
 
@@ -333,8 +741,17 @@ const redo = (): void => {
 
 const exportPattern = (): void => {
   try {
-    exportPatternAsPng(patternGrid.value)
+    exportPatternAsPng(patternGrid.value, { showLabels: showGridLabels.value })
     generationMessage.value = 'PNG 图纸已导出'
+  } catch (error) {
+    generationError.value = error instanceof Error ? error.message : '导出失败'
+  }
+}
+
+const exportInventory = (): void => {
+  try {
+    exportBeadInventoryAsCsv(patternGrid.value, activePaletteColors.value, activeManufacturerPalette.value.name)
+    generationMessage.value = '用珠清单已导出'
   } catch (error) {
     generationError.value = error instanceof Error ? error.message : '导出失败'
   }
@@ -422,11 +839,29 @@ const exportPattern = (): void => {
         <div class="min-w-0">
           <h2 class="truncate text-lg font-semibold">图片转拼豆图纸</h2>
           <p class="truncate text-xs text-ink-600 dark:text-ink-300">
-            {{ previewColumns }} x {{ previewRows }} · {{ selectedManufacturer }} · {{ usedColors.length }} 色
+            {{ previewColumns }} x {{ previewRows }} · {{ activeManufacturerPalette.name }} · {{ usedColors.length }} 色
           </p>
         </div>
 
         <div class="flex items-center gap-2">
+          <button
+            class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+            type="button"
+            title="打开项目"
+            @click="openProject"
+          >
+            <Icon icon="ri:folder-open-line" class="h-4 w-4" />
+            <span>打开</span>
+          </button>
+          <button
+            class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+            type="button"
+            title="保存项目"
+            @click="saveProject"
+          >
+            <Icon icon="ri:save-3-line" class="h-4 w-4" />
+            <span>保存</span>
+          </button>
           <label
             class="inline-flex cursor-pointer items-center gap-2 rounded-md bg-ink-900 px-3 py-2 text-sm font-medium text-white transition hover:bg-ink-800 dark:bg-ink-50 dark:text-ink-900 dark:hover:bg-white"
             title="导入图片"
@@ -435,6 +870,13 @@ const exportPattern = (): void => {
             <span>{{ isGenerating ? '转换中' : '导入图片' }}</span>
             <input class="hidden" type="file" accept="image/*" @change="onImageSelected" />
           </label>
+          <input
+            ref="projectFileInput"
+            class="hidden"
+            type="file"
+            accept=".pbd.json,.json,application/json"
+            @change="onProjectFileSelected"
+          />
           <button
             class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
             type="button"
@@ -465,8 +907,12 @@ const exportPattern = (): void => {
                 v-model="selectedManufacturer"
                 class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-mint dark:border-white/10 dark:bg-ink-900"
               >
-                <option v-for="manufacturer in manufacturers" :key="manufacturer">
-                  {{ manufacturer }}
+                <option
+                  v-for="palette in manufacturerPalettes"
+                  :key="palette.id"
+                  :value="palette.id"
+                >
+                  {{ palette.name }} · {{ palette.colors.length }} 色
                 </option>
               </select>
             </label>
@@ -487,11 +933,11 @@ const exportPattern = (): void => {
                 <span>{{ maxColors }}</span>
               </span>
               <input
-                v-model="maxColors"
+                v-model.number="maxColors"
                 class="w-full accent-bead-coral"
                 type="range"
                 min="8"
-                max="64"
+                :max="activePaletteColors.length"
                 step="1"
               />
             </label>
@@ -503,6 +949,13 @@ const exportPattern = (): void => {
               <input v-model="enableDithering" class="h-4 w-4 accent-bead-mint" type="checkbox" />
             </label>
 
+            <label
+              class="flex items-center justify-between rounded-md border border-ink-100 px-3 py-2 dark:border-white/10"
+            >
+              <span class="text-sm">显示标号</span>
+              <input v-model="showGridLabels" class="h-4 w-4 accent-bead-sky" type="checkbox" />
+            </label>
+
             <div class="rounded-md border border-ink-100 p-3 text-xs dark:border-white/10">
               <span class="block text-ink-500 dark:text-ink-400">来源</span>
               <strong class="mt-1 block truncate">{{ patternGrid.sourceName }}</strong>
@@ -511,6 +964,9 @@ const exportPattern = (): void => {
                 :class="generationError ? 'text-bead-coral' : ''"
               >
                 {{ generationError || generationMessage }}
+              </span>
+              <span class="mt-1 block text-ink-500 dark:text-ink-400">
+                {{ projectStatus }}
               </span>
             </div>
           </div>
@@ -545,9 +1001,50 @@ const exportPattern = (): void => {
                 <span class="block truncate font-semibold">{{ color.id }}</span>
                 <span class="block truncate text-ink-500 dark:text-ink-400">{{ color.name }}</span>
                 <span class="block truncate text-ink-500 dark:text-ink-400">
-                  {{ beadCountByColor[color.hex] ?? 0 }}
+                  {{ color.count }}
                 </span>
               </button>
+            </div>
+          </div>
+
+          <div class="mt-6 border-t border-ink-100 pt-4 dark:border-white/10">
+            <div class="mb-3 flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <Icon icon="ri:file-list-3-line" class="h-5 w-5 text-bead-amber" />
+                <h3 class="text-sm font-semibold">用珠清单</h3>
+              </div>
+              <button
+                type="button"
+                class="inline-flex items-center gap-1 rounded-md border border-ink-200 px-2 py-1 text-xs text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+                title="导出 CSV 清单"
+                @click="exportInventory"
+              >
+                <Icon icon="ri:download-2-line" class="h-3.5 w-3.5" />
+                <span>CSV</span>
+              </button>
+            </div>
+
+            <div class="max-h-56 overflow-auto rounded-md border border-ink-100 dark:border-white/10">
+              <div
+                v-for="item in beadInventory"
+                :key="item.hex"
+                class="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 border-b border-ink-100 px-2 py-2 text-xs last:border-b-0 dark:border-white/10"
+              >
+                <span
+                  class="h-5 w-5 rounded-sm border border-ink-200 dark:border-white/10"
+                  :style="{ backgroundColor: item.hex }"
+                ></span>
+                <div class="min-w-0">
+                  <strong class="block truncate">{{ item.id }} · {{ item.name }}</strong>
+                  <span class="block truncate text-ink-500 dark:text-ink-400">{{ item.hex }}</span>
+                </div>
+                <div class="text-right">
+                  <strong class="block">{{ item.count }}</strong>
+                  <span class="block text-[10px] text-ink-500 dark:text-ink-400">
+                    {{ (item.percentage * 100).toFixed(1) }}%
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
         </section>
@@ -601,25 +1098,51 @@ const exportPattern = (): void => {
             <div
               class="aspect-square w-full max-w-[620px] rounded-md border border-ink-200 bg-white p-3 shadow-panel dark:border-white/10 dark:bg-ink-800"
             >
-              <div
-                class="grid h-full w-full gap-px rounded bg-ink-200 p-1 dark:bg-black/30"
-                :style="{ gridTemplateColumns: `repeat(${previewColumns}, minmax(0, 1fr))` }"
-              >
-                <button
-                  v-for="(color, index) in beadCells"
-                  :key="index"
-                  class="bead-cell aspect-square rounded-full outline-none transition hover:scale-110 focus:scale-110 focus:ring-1 focus:ring-bead-coral"
-                  :style="{ backgroundColor: color }"
-                  type="button"
-                  :title="`${index % previewColumns}, ${Math.floor(index / previewColumns)}`"
-                  @click="onCellClick(index)"
-                ></button>
+              <div class="flex h-full w-full flex-col gap-1">
+                <div
+                  v-if="showGridLabels"
+                  class="ml-7 grid h-5 shrink-0 items-center text-center text-[9px] font-medium leading-none text-ink-500 dark:text-ink-300"
+                  :style="{ gridTemplateColumns: `repeat(${previewColumns}, minmax(0, 1fr))` }"
+                >
+                  <span v-for="(label, index) in columnLabels" :key="`column-${index}`">
+                    {{ label }}
+                  </span>
+                </div>
+
+                <div class="flex min-h-0 flex-1 gap-1">
+                  <div
+                    v-if="showGridLabels"
+                    class="grid w-6 shrink-0 items-center text-right text-[9px] font-medium leading-none text-ink-500 dark:text-ink-300"
+                    :style="{ gridTemplateRows: `repeat(${previewRows}, minmax(0, 1fr))` }"
+                  >
+                    <span v-for="(label, index) in rowLabels" :key="`row-${index}`">
+                      {{ label }}
+                    </span>
+                  </div>
+
+                  <div class="flex min-h-0 flex-1 items-center justify-center">
+                    <div
+                      class="grid aspect-square h-full max-h-full max-w-full gap-px rounded bg-ink-200 p-1 dark:bg-black/30"
+                      :style="{ gridTemplateColumns: `repeat(${previewColumns}, minmax(0, 1fr))` }"
+                    >
+                      <button
+                        v-for="(color, index) in beadCells"
+                        :key="index"
+                        class="bead-cell aspect-square rounded-[2px] outline-none transition hover:scale-110 focus:scale-110 focus:ring-1 focus:ring-bead-coral"
+                        :style="{ backgroundColor: color }"
+                        type="button"
+                        :title="`${index % previewColumns + 1}, ${Math.floor(index / previewColumns) + 1}`"
+                        @click="onCellClick(index)"
+                      ></button>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
 
           <div
-            class="grid grid-cols-4 gap-3 border-t border-ink-100 px-4 py-3 text-sm dark:border-white/10"
+            class="grid grid-cols-5 gap-3 border-t border-ink-100 px-4 py-3 text-sm dark:border-white/10"
           >
             <div>
               <span class="block text-xs text-ink-500 dark:text-ink-400">格子</span>
@@ -636,6 +1159,10 @@ const exportPattern = (): void => {
             <div>
               <span class="block text-xs text-ink-500 dark:text-ink-400">状态</span>
               <strong>{{ patternStatus }}</strong>
+            </div>
+            <div>
+              <span class="block text-xs text-ink-500 dark:text-ink-400">标号</span>
+              <strong>{{ showGridLabels ? '显示' : '隐藏' }}</strong>
             </div>
           </div>
         </section>
@@ -742,11 +1269,24 @@ const exportPattern = (): void => {
               class="inline-flex w-full items-center justify-center gap-2 rounded-md bg-bead-coral px-3 py-2.5 text-sm font-semibold text-white transition hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-55"
               type="button"
               title="AI 优化原图"
-              :disabled="!sourceFile"
+              :disabled="!sourceFile || isOptimizingImage || isGenerating"
+              @click="optimizeImageWithAi"
             >
-              <Icon icon="ri:magic-line" class="h-4 w-4" />
-              <span>AI 优化原图</span>
+              <Icon icon="ri:magic-line" class="h-4 w-4" :class="isOptimizingImage ? 'animate-spin' : ''" />
+              <span>{{ isOptimizingImage ? 'AI 优化中' : 'AI 优化原图' }}</span>
             </button>
+
+            <p
+              v-if="aiOptimizeStatus || aiOptimizeError"
+              class="rounded-md border px-3 py-2 text-xs"
+              :class="
+                aiOptimizeError
+                  ? 'border-bead-coral/30 bg-bead-coral/10 text-bead-coral'
+                  : 'border-bead-sky/30 bg-bead-sky/10 text-ink-700 dark:text-ink-100'
+              "
+            >
+              {{ aiOptimizeError || aiOptimizeStatus }}
+            </p>
           </form>
 
           <div class="mt-6 border-t border-ink-100 pt-4 dark:border-white/10">

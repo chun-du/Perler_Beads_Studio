@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { AiProviderConnection } from '../shared/ai'
+import type { AiImageOptimizationRequest, AiProviderConnection } from '../shared/ai'
+import type { ProjectSaveRequest } from '../shared/project'
 import type { PerlerBridge, ThemePreference } from '../shared/theme'
 
 const perlerBridge: PerlerBridge = {
@@ -20,7 +21,12 @@ const perlerBridge: PerlerBridge = {
     }
   },
   ai: {
-    listModels: (connection: AiProviderConnection) => ipcRenderer.invoke('ai:list-models', connection)
+    listModels: (connection: AiProviderConnection) => ipcRenderer.invoke('ai:list-models', connection),
+    optimizeImage: (request: AiImageOptimizationRequest) => ipcRenderer.invoke('ai:optimize-image', request)
+  },
+  project: {
+    saveProject: (request: ProjectSaveRequest) => ipcRenderer.invoke('project:save', request),
+    openProject: () => ipcRenderer.invoke('project:open')
   }
 }
 

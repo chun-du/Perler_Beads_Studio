@@ -1,4 +1,4 @@
-import type { BeadColor } from '@renderer/data/studio'
+import type { BeadColor } from '@renderer/data/palettes'
 
 export interface PatternGrid {
   columns: number
@@ -12,6 +12,15 @@ export interface PatternGenerationOptions {
   maxColors: number
   dithering: boolean
   palette: BeadColor[]
+}
+
+export interface PatternExportOptions {
+  showLabels: boolean
+}
+
+export interface BeadInventoryItem extends BeadColor {
+  count: number
+  percentage: number
 }
 
 interface RgbColor {
@@ -60,6 +69,37 @@ const getNearestColor = (r: number, g: number, b: number, palette: RgbColor[]): 
   return nearestColor
 }
 
+const selectPaletteForImage = (imageData: ImageData, palette: RgbColor[], maxColors: number): RgbColor[] => {
+  const colorLimit = Math.max(1, Math.min(maxColors, palette.length))
+
+  if (colorLimit >= palette.length) {
+    return palette
+  }
+
+  const counts = new Map<string, { color: RgbColor; count: number }>()
+
+  for (let index = 0; index < imageData.data.length; index += 4) {
+    const nearestColor = getNearestColor(
+      imageData.data[index],
+      imageData.data[index + 1],
+      imageData.data[index + 2],
+      palette
+    )
+    const current = counts.get(nearestColor.hex)
+
+    if (current) {
+      current.count += 1
+    } else {
+      counts.set(nearestColor.hex, { color: nearestColor, count: 1 })
+    }
+  }
+
+  return [...counts.values()]
+    .sort((left, right) => right.count - left.count)
+    .slice(0, colorLimit)
+    .map((item) => item.color)
+}
+
 const loadImage = async (source: string): Promise<HTMLImageElement> => {
   return new Promise((resolve, reject) => {
     const image = new Image()
@@ -70,7 +110,7 @@ const loadImage = async (source: string): Promise<HTMLImageElement> => {
   })
 }
 
-const readFileAsDataUrl = async (file: File): Promise<string> => {
+export const readImageFileAsDataUrl = async (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
 
@@ -97,12 +137,12 @@ const diffuseError = (
   data[index + 2] += error.b * factor
 }
 
-export const createPatternFromImageFile = async (
-  file: File,
+export const createPatternFromImageDataUrl = async (
+  source: string,
+  sourceName: string,
   options: PatternGenerationOptions
 ): Promise<PatternGrid> => {
   const { columns, rows } = parseBoardSize(options.boardSize)
-  const source = await readFileAsDataUrl(file)
   const image = await loadImage(source)
   const canvas = document.createElement('canvas')
   const context = canvas.getContext('2d', { willReadFrequently: true })
@@ -132,8 +172,8 @@ export const createPatternFromImageFile = async (
   context.drawImage(image, sx, sy, sw, sh, 0, 0, columns, rows)
 
   const imageData = context.getImageData(0, 0, columns, rows)
-  const activePalette = options.palette.slice(0, Math.max(1, Math.min(options.maxColors, options.palette.length)))
-  const rgbPalette = activePalette.map((color) => parseHex(color.hex))
+  const rgbPalette = options.palette.map((color) => parseHex(color.hex))
+  const activePalette = selectPaletteForImage(imageData, rgbPalette, options.maxColors)
   const cells: string[] = new Array(columns * rows)
 
   if (options.dithering) {
@@ -172,8 +212,16 @@ export const createPatternFromImageFile = async (
     columns,
     rows,
     cells,
-    sourceName: file.name
+    sourceName
   }
+}
+
+export const createPatternFromImageFile = async (
+  file: File,
+  options: PatternGenerationOptions
+): Promise<PatternGrid> => {
+  const source = await readImageFileAsDataUrl(file)
+  return createPatternFromImageDataUrl(source, file.name, options)
 }
 
 export const createSamplePattern = (palette: BeadColor[], columns = 24, rows = 24): PatternGrid => {
@@ -216,8 +264,71 @@ export const createSamplePattern = (palette: BeadColor[], columns = 24, rows = 2
   return { columns, rows, cells, sourceName: '示例图纸' }
 }
 
-export const exportPatternAsPng = (pattern: PatternGrid): void => {
+const shouldShowLabel = (value: number, maxValue: number): boolean => {
+  return value === 1 || value === maxValue || value % 5 === 0
+}
+
+export const buildBeadInventory = (pattern: PatternGrid, palette: BeadColor[]): BeadInventoryItem[] => {
+  const countMap = pattern.cells.reduce<Record<string, number>>((counts, color) => {
+    counts[color] = (counts[color] ?? 0) + 1
+    return counts
+  }, {})
+  const totalCount = Math.max(1, pattern.cells.length)
+  const knownColors = palette
+    .filter((color) => countMap[color.hex] > 0)
+    .map((color) => ({
+      ...color,
+      count: countMap[color.hex],
+      percentage: countMap[color.hex] / totalCount
+    }))
+
+  const knownHexes = new Set(palette.map((color) => color.hex))
+  const unknownColors = Object.entries(countMap)
+    .filter(([hex]) => !knownHexes.has(hex))
+    .map(([hex, count], index) => ({
+      id: `C${String(index + 1).padStart(2, '0')}`,
+      name: 'Custom',
+      hex,
+      count,
+      percentage: count / totalCount
+    }))
+
+  return [...knownColors, ...unknownColors].sort((left, right) => right.count - left.count)
+}
+
+const escapeCsvValue = (value: string | number): string => {
+  const text = String(value)
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+}
+
+export const exportBeadInventoryAsCsv = (
+  pattern: PatternGrid,
+  palette: BeadColor[],
+  manufacturer: string
+): void => {
+  const inventory = buildBeadInventory(pattern, palette)
+  const header = ['manufacturer', 'color_id', 'color_name', 'hex', 'count', 'percentage']
+  const rows = inventory.map((item) => [
+    manufacturer,
+    item.id,
+    item.name,
+    item.hex,
+    item.count,
+    `${(item.percentage * 100).toFixed(2)}%`
+  ])
+  const csv = [header, ...rows].map((row) => row.map(escapeCsvValue).join(',')).join('\n')
+  const blob = new Blob([`\ufeff${csv}\n`], { type: 'text/csv;charset=utf-8' })
+  const link = document.createElement('a')
+
+  link.download = `perler-bead-list-${pattern.columns}x${pattern.rows}.csv`
+  link.href = URL.createObjectURL(blob)
+  link.click()
+  URL.revokeObjectURL(link.href)
+}
+
+export const exportPatternAsPng = (pattern: PatternGrid, options: PatternExportOptions): void => {
   const cellSize = 20
+  const labelSize = options.showLabels ? 30 : 0
   const padding = 24
   const canvas = document.createElement('canvas')
   const context = canvas.getContext('2d')
@@ -226,24 +337,40 @@ export const exportPatternAsPng = (pattern: PatternGrid): void => {
     throw new Error('当前环境不支持 Canvas')
   }
 
-  canvas.width = pattern.columns * cellSize + padding * 2
-  canvas.height = pattern.rows * cellSize + padding * 2
+  canvas.width = pattern.columns * cellSize + padding * 2 + labelSize
+  canvas.height = pattern.rows * cellSize + padding * 2 + labelSize
   context.fillStyle = '#ffffff'
   context.fillRect(0, 0, canvas.width, canvas.height)
+  context.font = '12px Arial, sans-serif'
+  context.textAlign = 'center'
+  context.textBaseline = 'middle'
+  context.fillStyle = '#63594d'
+
+  if (options.showLabels) {
+    for (let x = 0; x < pattern.columns; x += 1) {
+      const label = x + 1
+      if (!shouldShowLabel(label, pattern.columns)) continue
+      context.fillText(String(label), padding + labelSize + x * cellSize + cellSize / 2, padding + labelSize / 2)
+    }
+
+    for (let y = 0; y < pattern.rows; y += 1) {
+      const label = y + 1
+      if (!shouldShowLabel(label, pattern.rows)) continue
+      context.fillText(String(label), padding + labelSize / 2, padding + labelSize + y * cellSize + cellSize / 2)
+    }
+  }
 
   pattern.cells.forEach((color, index) => {
     const x = index % pattern.columns
     const y = Math.floor(index / pattern.columns)
-    const centerX = padding + x * cellSize + cellSize / 2
-    const centerY = padding + y * cellSize + cellSize / 2
+    const cellX = padding + labelSize + x * cellSize
+    const cellY = padding + labelSize + y * cellSize
 
     context.fillStyle = color
-    context.beginPath()
-    context.arc(centerX, centerY, cellSize * 0.42, 0, Math.PI * 2)
-    context.fill()
+    context.fillRect(cellX + 1, cellY + 1, cellSize - 2, cellSize - 2)
     context.strokeStyle = 'rgba(0, 0, 0, 0.22)'
     context.lineWidth = 1
-    context.stroke()
+    context.strokeRect(cellX + 0.5, cellY + 0.5, cellSize - 1, cellSize - 1)
   })
 
   const link = document.createElement('a')
