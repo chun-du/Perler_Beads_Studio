@@ -16,6 +16,8 @@ export interface PatternGenerationOptions {
 
 export interface PatternExportOptions {
   showLabels: boolean
+  palette: BeadColor[]
+  manufacturer: string
 }
 
 export interface BeadInventoryItem extends BeadColor {
@@ -23,11 +25,23 @@ export interface BeadInventoryItem extends BeadColor {
   percentage: number
 }
 
+export const EMPTY_CELL = '__empty__'
+
+export const isEmptyCell = (color: string): boolean => {
+  return color === EMPTY_CELL
+}
+
 interface RgbColor {
   r: number
   g: number
   b: number
   hex: string
+}
+
+const transparentAlphaThreshold = 16
+
+const isTransparentAlpha = (alpha: number): boolean => {
+  return alpha <= transparentAlphaThreshold
 }
 
 const parseHex = (hex: string): RgbColor => {
@@ -38,6 +52,13 @@ const parseHex = (hex: string): RgbColor => {
     b: Number.parseInt(normalized.slice(4, 6), 16),
     hex
   }
+}
+
+const getReadableTextColor = (hex: string): string => {
+  const color = parseHex(hex)
+  const luminance = (color.r * 299 + color.g * 587 + color.b * 114) / 1000
+
+  return luminance > 145 ? '#111111' : '#ffffff'
 }
 
 export const parseBoardSize = (boardSize: string): { columns: number; rows: number } => {
@@ -69,6 +90,30 @@ const getNearestColor = (r: number, g: number, b: number, palette: RgbColor[]): 
   return nearestColor
 }
 
+const getCompositedRgb = (
+  data: Uint8ClampedArray | Float32Array,
+  index: number
+): { r: number; g: number; b: number } => {
+  const alpha = data[index + 3]
+
+  if (alpha >= 255) {
+    return {
+      r: data[index],
+      g: data[index + 1],
+      b: data[index + 2]
+    }
+  }
+
+  const opacity = alpha / 255
+  const inverseOpacity = 1 - opacity
+
+  return {
+    r: data[index] * opacity + 255 * inverseOpacity,
+    g: data[index + 1] * opacity + 255 * inverseOpacity,
+    b: data[index + 2] * opacity + 255 * inverseOpacity
+  }
+}
+
 const selectPaletteForImage = (imageData: ImageData, palette: RgbColor[], maxColors: number): RgbColor[] => {
   const colorLimit = Math.max(1, Math.min(maxColors, palette.length))
 
@@ -79,12 +124,10 @@ const selectPaletteForImage = (imageData: ImageData, palette: RgbColor[], maxCol
   const counts = new Map<string, { color: RgbColor; count: number }>()
 
   for (let index = 0; index < imageData.data.length; index += 4) {
-    const nearestColor = getNearestColor(
-      imageData.data[index],
-      imageData.data[index + 1],
-      imageData.data[index + 2],
-      palette
-    )
+    if (isTransparentAlpha(imageData.data[index + 3])) continue
+
+    const pixel = getCompositedRgb(imageData.data, index)
+    const nearestColor = getNearestColor(pixel.r, pixel.g, pixel.b, palette)
     const current = counts.get(nearestColor.hex)
 
     if (current) {
@@ -94,10 +137,12 @@ const selectPaletteForImage = (imageData: ImageData, palette: RgbColor[], maxCol
     }
   }
 
-  return [...counts.values()]
+  const selectedColors = [...counts.values()]
     .sort((left, right) => right.count - left.count)
     .slice(0, colorLimit)
     .map((item) => item.color)
+
+  return selectedColors.length > 0 ? selectedColors : palette.slice(0, colorLimit)
 }
 
 const loadImage = async (source: string): Promise<HTMLImageElement> => {
@@ -179,10 +224,25 @@ export const createPatternFromImageDataUrl = async (
   if (options.dithering) {
     const data = new Float32Array(imageData.data)
 
+    for (let index = 0; index < data.length; index += 4) {
+      if (isTransparentAlpha(imageData.data[index + 3])) continue
+
+      const pixel = getCompositedRgb(imageData.data, index)
+      data[index] = pixel.r
+      data[index + 1] = pixel.g
+      data[index + 2] = pixel.b
+    }
+
     for (let y = 0; y < rows; y += 1) {
       for (let x = 0; x < columns; x += 1) {
         const index = (y * columns + x) * 4
-        const nearestColor = getNearestColor(data[index], data[index + 1], data[index + 2], rgbPalette)
+
+        if (isTransparentAlpha(imageData.data[index + 3])) {
+          cells[y * columns + x] = EMPTY_CELL
+          continue
+        }
+
+        const nearestColor = getNearestColor(data[index], data[index + 1], data[index + 2], activePalette)
         const error = {
           r: data[index] - nearestColor.r,
           g: data[index + 1] - nearestColor.g,
@@ -198,12 +258,13 @@ export const createPatternFromImageDataUrl = async (
     }
   } else {
     for (let index = 0; index < imageData.data.length; index += 4) {
-      const nearestColor = getNearestColor(
-        imageData.data[index],
-        imageData.data[index + 1],
-        imageData.data[index + 2],
-        rgbPalette
-      )
+      if (isTransparentAlpha(imageData.data[index + 3])) {
+        cells[index / 4] = EMPTY_CELL
+        continue
+      }
+
+      const pixel = getCompositedRgb(imageData.data, index)
+      const nearestColor = getNearestColor(pixel.r, pixel.g, pixel.b, activePalette)
       cells[index / 4] = nearestColor.hex
     }
   }
@@ -270,10 +331,15 @@ const shouldShowLabel = (value: number, maxValue: number): boolean => {
 
 export const buildBeadInventory = (pattern: PatternGrid, palette: BeadColor[]): BeadInventoryItem[] => {
   const countMap = pattern.cells.reduce<Record<string, number>>((counts, color) => {
+    if (isEmptyCell(color)) return counts
+
     counts[color] = (counts[color] ?? 0) + 1
     return counts
   }, {})
-  const totalCount = Math.max(1, pattern.cells.length)
+  const totalCount = Math.max(
+    1,
+    Object.values(countMap).reduce((total, count) => total + count, 0)
+  )
   const knownColors = palette
     .filter((color) => countMap[color.hex] > 0)
     .map((color) => ({
@@ -284,7 +350,7 @@ export const buildBeadInventory = (pattern: PatternGrid, palette: BeadColor[]): 
 
   const knownHexes = new Set(palette.map((color) => color.hex))
   const unknownColors = Object.entries(countMap)
-    .filter(([hex]) => !knownHexes.has(hex))
+    .filter(([hex]) => !knownHexes.has(hex) && !isEmptyCell(hex))
     .map(([hex, count], index) => ({
       id: `C${String(index + 1).padStart(2, '0')}`,
       name: 'Custom',
@@ -327,9 +393,23 @@ export const exportBeadInventoryAsCsv = (
 }
 
 export const exportPatternAsPng = (pattern: PatternGrid, options: PatternExportOptions): void => {
-  const cellSize = 20
-  const labelSize = options.showLabels ? 30 : 0
+  const cellSize = 26
+  const labelSize = 28
   const padding = 24
+  const titleHeight = 56
+  const legendGap = 18
+  const legendItemWidth = 78
+  const legendItemHeight = 52
+  const legendSwatchSize = 30
+  const inventory = buildBeadInventory(pattern, options.palette)
+  const gridWidth = pattern.columns * cellSize
+  const gridHeight = pattern.rows * cellSize
+  const chartWidth = gridWidth + labelSize * 2
+  const chartHeight = gridHeight + labelSize * 2
+  const legendColumns = Math.max(1, Math.floor(chartWidth / legendItemWidth))
+  const legendRows = Math.ceil(inventory.length / legendColumns)
+  const legendHeight = inventory.length > 0 ? legendRows * legendItemHeight : 0
+  const inventoryByHex = new Map(inventory.map((item) => [item.hex, item]))
   const canvas = document.createElement('canvas')
   const context = canvas.getContext('2d')
 
@@ -337,40 +417,128 @@ export const exportPatternAsPng = (pattern: PatternGrid, options: PatternExportO
     throw new Error('当前环境不支持 Canvas')
   }
 
-  canvas.width = pattern.columns * cellSize + padding * 2 + labelSize
-  canvas.height = pattern.rows * cellSize + padding * 2 + labelSize
+  canvas.width = chartWidth + padding * 2
+  canvas.height = titleHeight + chartHeight + legendGap + legendHeight + padding * 2
+
+  const chartX = padding
+  const chartY = padding + titleHeight
+  const gridX = chartX + labelSize
+  const gridY = chartY + labelSize
+  const legendY = chartY + chartHeight + legendGap
+
   context.fillStyle = '#ffffff'
   context.fillRect(0, 0, canvas.width, canvas.height)
-  context.font = '12px Arial, sans-serif'
-  context.textAlign = 'center'
-  context.textBaseline = 'middle'
-  context.fillStyle = '#63594d'
+
+  context.fillStyle = '#161719'
+  context.font = '700 24px Arial, sans-serif'
+  context.textAlign = 'left'
+  context.textBaseline = 'top'
+  context.fillText('拼豆图纸', padding, padding)
+  context.font = '14px Arial, sans-serif'
+  context.fillStyle = '#55585f'
+  context.fillText(
+    `${pattern.columns} x ${pattern.rows} · ${options.manufacturer} · ${inventory.length} 色`,
+    padding,
+    padding + 32
+  )
+
+  context.fillStyle = '#d5d5d5'
+  context.fillRect(gridX, chartY, gridWidth, labelSize)
+  context.fillRect(gridX, gridY + gridHeight, gridWidth, labelSize)
+  context.fillRect(chartX, gridY, labelSize, gridHeight)
+  context.fillRect(gridX + gridWidth, gridY, labelSize, gridHeight)
+  context.fillStyle = '#fdfdfd'
+  context.fillRect(gridX, gridY, gridWidth, gridHeight)
 
   if (options.showLabels) {
+    context.font = '9px Arial, sans-serif'
+    context.textAlign = 'center'
+    context.textBaseline = 'middle'
+    context.fillStyle = '#1d1d1f'
+
     for (let x = 0; x < pattern.columns; x += 1) {
       const label = x + 1
-      if (!shouldShowLabel(label, pattern.columns)) continue
-      context.fillText(String(label), padding + labelSize + x * cellSize + cellSize / 2, padding + labelSize / 2)
+      const labelX = gridX + x * cellSize + cellSize / 2
+
+      context.fillText(String(label), labelX, chartY + labelSize / 2)
+      context.fillText(String(label), labelX, gridY + gridHeight + labelSize / 2)
     }
 
     for (let y = 0; y < pattern.rows; y += 1) {
       const label = y + 1
-      if (!shouldShowLabel(label, pattern.rows)) continue
-      context.fillText(String(label), padding + labelSize / 2, padding + labelSize + y * cellSize + cellSize / 2)
+      const labelY = gridY + y * cellSize + cellSize / 2
+
+      context.fillText(String(label), chartX + labelSize / 2, labelY)
+      context.fillText(String(label), gridX + gridWidth + labelSize / 2, labelY)
     }
   }
 
   pattern.cells.forEach((color, index) => {
     const x = index % pattern.columns
     const y = Math.floor(index / pattern.columns)
-    const cellX = padding + labelSize + x * cellSize
-    const cellY = padding + labelSize + y * cellSize
+    const cellX = gridX + x * cellSize
+    const cellY = gridY + y * cellSize
 
-    context.fillStyle = color
-    context.fillRect(cellX + 1, cellY + 1, cellSize - 2, cellSize - 2)
-    context.strokeStyle = 'rgba(0, 0, 0, 0.22)'
+    if (!isEmptyCell(color)) {
+      const colorInfo = inventoryByHex.get(color)
+
+      context.fillStyle = color
+      context.fillRect(cellX + 1, cellY + 1, cellSize - 2, cellSize - 2)
+      context.font = '8px Arial, sans-serif'
+      context.textAlign = 'center'
+      context.textBaseline = 'middle'
+      context.fillStyle = getReadableTextColor(color)
+      context.fillText(colorInfo?.id ?? '', cellX + cellSize / 2, cellY + cellSize / 2)
+    }
+  })
+
+  for (let x = 0; x <= pattern.columns; x += 1) {
+    const lineX = gridX + x * cellSize + 0.5
+
+    context.beginPath()
+    context.moveTo(lineX, gridY)
+    context.lineTo(lineX, gridY + gridHeight)
+    context.strokeStyle = x % 5 === 0 ? '#111111' : '#8a8a8a'
+    context.lineWidth = x % 5 === 0 ? 2 : 1
+    context.stroke()
+  }
+
+  for (let y = 0; y <= pattern.rows; y += 1) {
+    const lineY = gridY + y * cellSize + 0.5
+
+    context.beginPath()
+    context.moveTo(gridX, lineY)
+    context.lineTo(gridX + gridWidth, lineY)
+    context.strokeStyle = y % 5 === 0 ? '#111111' : '#8a8a8a'
+    context.lineWidth = y % 5 === 0 ? 2 : 1
+    context.stroke()
+  }
+
+  context.strokeStyle = '#111111'
+  context.lineWidth = 2
+  context.strokeRect(chartX + 0.5, chartY + 0.5, chartWidth - 1, chartHeight - 1)
+
+  inventory.forEach((item, index) => {
+    const row = Math.floor(index / legendColumns)
+    const column = index % legendColumns
+    const itemX = chartX + column * legendItemWidth
+    const itemY = legendY + row * legendItemHeight
+    const swatchX = itemX + 2
+    const swatchY = itemY
+
+    context.fillStyle = item.hex
+    context.fillRect(swatchX, swatchY, legendSwatchSize, legendSwatchSize)
+    context.strokeStyle = '#bfc1c5'
     context.lineWidth = 1
-    context.strokeRect(cellX + 0.5, cellY + 0.5, cellSize - 1, cellSize - 1)
+    context.strokeRect(swatchX + 0.5, swatchY + 0.5, legendSwatchSize - 1, legendSwatchSize - 1)
+    context.font = '10px Arial, sans-serif'
+    context.textAlign = 'center'
+    context.textBaseline = 'middle'
+    context.fillStyle = getReadableTextColor(item.hex)
+    context.fillText(item.id, swatchX + legendSwatchSize / 2, swatchY + legendSwatchSize / 2)
+    context.font = '11px Arial, sans-serif'
+    context.fillStyle = '#1d1d1f'
+    context.fillText(String(item.count), swatchX + legendSwatchSize / 2, swatchY + legendSwatchSize + 13)
   })
 
   const link = document.createElement('a')

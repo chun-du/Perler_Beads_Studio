@@ -153,6 +153,7 @@ image file
 -> HTMLImageElement
 -> center-crop draw to canvas at board dimensions
 -> pixel readback
+-> transparent pixels become no-bead cells
 -> nearest palette color
 -> optional Floyd-Steinberg dithering
 -> editable grid cells
@@ -162,6 +163,8 @@ Guidelines:
 
 - Keep final grid generation deterministic.
 - AI output, if used, must become an intermediate image reference and still pass through the deterministic grid generator.
+- Transparent source pixels must remain no-bead cells and must not be matched to black.
+- Semi-transparent pixels should be composited against white before palette matching to avoid dark fringes.
 - Prefer perceptual color matching in future work. RGB distance is acceptable only as the current MVP baseline.
 - Real manufacturer palettes should preserve manufacturer code, color name, RGB, and later Lab values.
 - Board settings must always stay in sync with generated grid dimensions.
@@ -170,7 +173,6 @@ Guidelines:
 Future pattern work:
 
 - Lab/CIEDE2000 matching.
-- No-bead/transparent cells.
 - Region smoothing and isolated-pixel cleanup.
 - Palette reduction by selected manufacturer inventory.
 - Bead count export grouped by manufacturer code.
@@ -210,7 +212,7 @@ Future editor work:
 
 Current export:
 
-- PNG bead layout.
+- PNG printable chart with coordinate rulers, bead IDs, heavy 5-cell grid lines, and a bottom bead legend.
 - CSV bead inventory grouped by manufacturer color code.
 
 Future export targets:
@@ -223,6 +225,7 @@ Future export targets:
 - Project package export.
 
 Print/export output must be reproducible from saved project data.
+Do not add watermarks to exported pattern sheets unless the user explicitly asks for branded output.
 
 ## Project File Rules
 

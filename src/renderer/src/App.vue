@@ -17,8 +17,10 @@ import {
   createPatternFromImageFile,
   createPatternFromImageDataUrl,
   createSamplePattern,
+  EMPTY_CELL,
   exportBeadInventoryAsCsv,
   exportPatternAsPng,
+  isEmptyCell,
   parseBoardSize,
   readImageFileAsDataUrl
 } from './utils/pattern'
@@ -115,6 +117,17 @@ const displayedColors = computed(() => beadInventory.value.slice(0, 9))
 const selectedColor = computed(() => {
   return activePaletteColors.value.find((color) => color.hex === selectedColorHex.value) ?? activePaletteColors.value[0]
 })
+
+const getCellBackgroundColor = (color: string): string => {
+  return isEmptyCell(color) ? '#ffffff' : color
+}
+
+const getCellTitle = (color: string, index: number): string => {
+  const x = (index % previewColumns.value) + 1
+  const y = Math.floor(index / previewColumns.value) + 1
+
+  return isEmptyCell(color) ? `${x}, ${y} · 空格` : `${x}, ${y}`
+}
 
 const themeOptions: Array<{ value: ThemePreference; icon: string; label: string }> = [
   { value: 'system', icon: 'ri:computer-line', label: '系统' },
@@ -705,13 +718,18 @@ const onCellClick = (index: number): void => {
   const currentColor = patternGrid.value.cells[index]
 
   if (activeTool.value === 'eyedropper') {
+    if (isEmptyCell(currentColor)) {
+      activeTool.value = 'eraser'
+      return
+    }
+
     selectedColorHex.value = currentColor
     activeTool.value = 'pencil'
     return
   }
 
   if (activeTool.value === 'eraser') {
-    replaceCell(index, activePaletteColors.value[0].hex)
+    replaceCell(index, EMPTY_CELL)
     return
   }
 
@@ -741,7 +759,11 @@ const redo = (): void => {
 
 const exportPattern = (): void => {
   try {
-    exportPatternAsPng(patternGrid.value, { showLabels: showGridLabels.value })
+    exportPatternAsPng(patternGrid.value, {
+      showLabels: showGridLabels.value,
+      palette: activePaletteColors.value,
+      manufacturer: activeManufacturerPalette.value.name
+    })
     generationMessage.value = 'PNG 图纸已导出'
   } catch (error) {
     generationError.value = error instanceof Error ? error.message : '导出失败'
@@ -1129,9 +1151,9 @@ const exportInventory = (): void => {
                         v-for="(color, index) in beadCells"
                         :key="index"
                         class="bead-cell aspect-square rounded-[2px] outline-none transition hover:scale-110 focus:scale-110 focus:ring-1 focus:ring-bead-coral"
-                        :style="{ backgroundColor: color }"
+                        :style="{ backgroundColor: getCellBackgroundColor(color) }"
                         type="button"
-                        :title="`${index % previewColumns + 1}, ${Math.floor(index / previewColumns) + 1}`"
+                        :title="getCellTitle(color, index)"
                         @click="onCellClick(index)"
                       ></button>
                     </div>
