@@ -7,6 +7,7 @@ export interface AiProviderConnection {
 export interface AiImageOptimizationRequest extends AiProviderConnection {
   model: string
   optimizationMode: string
+  prompt?: string
   imageDataUrl: string
   imageName?: string
 }
@@ -98,12 +99,19 @@ export const buildAiImageEditsUrl = (baseUrl: string): string => {
   return buildAiEndpointUrl(baseUrl, 'images/edits')
 }
 
-export const createAiImageOptimizationPrompt = (mode: string): string => {
-  return [
+export const createAiImageOptimizationPrompt = (mode: string, prompt?: string): string => {
+  const basePrompt = [
     'Create a clean reference image for converting into a Perler bead pattern.',
     'Preserve the main subject and recognizable silhouette.',
     'Simplify tiny details, reduce visual noise, use flatter color regions, and keep the subject centered.',
     'Do not add text, watermarks, borders, or new unrelated objects.',
     `Optimization mode: ${mode}.`
-  ].join(' ')
+  ]
+
+  const trimmedPrompt = prompt?.trim()
+  if (trimmedPrompt) {
+    basePrompt.push(`User direction: ${trimmedPrompt}`)
+  }
+
+  return basePrompt.join(' ')
 }

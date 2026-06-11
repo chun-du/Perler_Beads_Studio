@@ -97,6 +97,10 @@ const aiOptimizeError = ref('')
 const aiReferenceDataUrl = ref('')
 const aiReferenceName = ref('')
 const selectedColorHex = ref(activePaletteColors.value[3]?.hex ?? activePaletteColors.value[0].hex)
+const isPalettePickerOpen = ref(false)
+const paletteSearchQuery = ref('')
+const isAiSettingsOpen = ref(false)
+const aiPrompt = ref('')
 const activeTool = ref<EditorTool>('pencil')
 const undoStack = ref<string[][]>([])
 const redoStack = ref<string[][]>([])
@@ -139,13 +143,6 @@ const providerStatus = ref('')
 const providerError = ref('')
 const secureStorageAvailable = ref(false)
 
-const capabilityOptions: Array<{ id: AiModelCapability; icon: string; label: string }> = [
-  { id: 'image-editing', icon: 'ri:image-edit-line', label: '图片编辑' },
-  { id: 'image-generation', icon: 'ri:image-add-line', label: '图片生成' },
-  { id: 'vision', icon: 'ri:eye-line', label: '视觉理解' },
-  { id: 'text', icon: 'ri:text', label: '文本' }
-]
-
 const aiProviderOptions = computed<AiProviderOption[]>(() => {
   const presetOptions = aiProviderPresets.map((provider) => ({
     id: provider.id,
@@ -175,7 +172,6 @@ const selectedProvider = computed(() => {
   return aiProviderOptions.value.find((provider) => provider.id === selectedProviderId.value) ?? aiProviderOptions.value[0]
 })
 
-const selectedModelCapabilities = computed(() => capabilitiesByModel.value[selectedModel.value] ?? [])
 const selectedProviderHasStoredKey = computed(() => selectedProvider.value?.isSavedProfile === true && selectedProvider.value.hasApiKey)
 const isDesktopAiRuntime = computed(() => window.perler?.ai !== undefined)
 const canUseStoredApiKey = computed(() => window.perler?.ai !== undefined && selectedProviderHasStoredKey.value)
@@ -200,6 +196,18 @@ const actualUsedColorCount = computed(() => {
 })
 
 const displayedColors = computed(() => beadInventory.value.slice(0, 9))
+const usedColorCounts = computed(() => {
+  return new Map(beadInventory.value.map((color) => [color.hex, color.count]))
+})
+const filteredPaletteColors = computed(() => {
+  const query = paletteSearchQuery.value.trim().toLowerCase()
+
+  if (!query) return activePaletteColors.value
+
+  return activePaletteColors.value.filter((color) => {
+    return `${color.id} ${color.name} ${color.hex}`.toLowerCase().includes(query)
+  })
+})
 const canvasZoomPercent = computed(() => Math.round(canvasZoom.value * 100))
 const canvasCursorClass = computed(() => {
   if (isCanvasDragging.value) return 'cursor-grabbing'
@@ -215,6 +223,20 @@ const canvasShellStyle = computed(() => ({
 const selectedColor = computed(() => {
   return activePaletteColors.value.find((color) => color.hex === selectedColorHex.value) ?? activePaletteColors.value[0]
 })
+const selectedColorLabel = computed(() => `${selectedColor.value.id} ${selectedColor.value.name}`)
+
+const selectPaletteColor = (colorHex: string): void => {
+  selectedColorHex.value = colorHex
+  isPalettePickerOpen.value = false
+
+  if (activeTool.value === 'eraser' || activeTool.value === 'eyedropper') {
+    activeTool.value = 'pencil'
+  }
+}
+
+const closePalettePicker = (): void => {
+  isPalettePickerOpen.value = false
+}
 
 const themeOptions: Array<{ value: ThemePreference; icon: string; label: string }> = [
   { value: 'system', icon: 'ri:computer-line', label: '系统' },
@@ -304,14 +326,17 @@ const saveProviderProfile = async (): Promise<void> => {
 
   try {
     const providerId = selectedProvider.value?.isSavedProfile ? selectedProviderId.value : undefined
+    const capabilitiesByImageModel = {
+      [selectedModel.value]: ['image-generation' as AiModelCapability]
+    }
     const result = await window.perler.ai.saveProviderProfile({
       profile: {
         id: providerId,
         name: providerName.value,
         baseUrl: baseUrl.value,
-        models: modelOptions.value,
+        models: [...modelOptions.value],
         selectedModel: selectedModel.value,
-        capabilitiesByModel: capabilitiesByModel.value
+        capabilitiesByModel: capabilitiesByImageModel
       },
       apiKey: apiKey.value || undefined
     })
@@ -367,21 +392,6 @@ const deleteProviderProfile = async (): Promise<void> => {
     providerError.value = error instanceof Error ? error.message : '供应商档案删除失败'
   } finally {
     isDeletingProvider.value = false
-  }
-}
-
-const toggleSelectedModelCapability = (capability: AiModelCapability): void => {
-  const model = selectedModel.value
-  if (!model) return
-
-  const currentCapabilities = capabilitiesByModel.value[model] ?? []
-  const nextCapabilities = currentCapabilities.includes(capability)
-    ? currentCapabilities.filter((item) => item !== capability)
-    : [...currentCapabilities, capability]
-
-  capabilitiesByModel.value = {
-    ...capabilitiesByModel.value,
-    [model]: nextCapabilities
   }
 }
 
@@ -891,7 +901,19 @@ const onPatternPreviewKeydown = (event: KeyboardEvent): void => {
     return
   }
 
-  if (event.key !== 'Escape' || !isPatternOverlayFullscreen.value) return
+  if (event.key !== 'Escape') return
+
+  if (isAiSettingsOpen.value) {
+    isAiSettingsOpen.value = false
+    return
+  }
+
+  if (isPalettePickerOpen.value) {
+    isPalettePickerOpen.value = false
+    return
+  }
+
+  if (!isPatternOverlayFullscreen.value) return
 
   isPatternOverlayFullscreen.value = false
   syncPatternFullscreenState()
@@ -952,7 +974,8 @@ const buildSavedProject = (): SavedProject => {
       providerId: selectedProviderId.value,
       baseUrl: baseUrl.value,
       modelId: selectedModel.value,
-      optimizationMode: selectedMode.value
+      optimizationMode: selectedMode.value,
+      prompt: aiPrompt.value
     }
   }
 }
@@ -977,6 +1000,7 @@ const applySavedProject = (project: SavedProject, displayName: string): void => 
   providerName.value = matchingProvider?.name ?? project.ai.providerId
   baseUrl.value = project.ai.baseUrl
   selectedMode.value = project.ai.optimizationMode
+  aiPrompt.value = project.ai.prompt ?? ''
 
   if (!modelOptions.value.includes(project.ai.modelId)) {
     modelOptions.value = [project.ai.modelId, ...modelOptions.value]
@@ -1180,7 +1204,7 @@ const optimizeImageInBrowser = async (
   const body = new FormData()
 
   body.append('model', request.model.trim())
-  body.append('prompt', createAiImageOptimizationPrompt(request.optimizationMode))
+  body.append('prompt', createAiImageOptimizationPrompt(request.optimizationMode, request.prompt))
   body.append('image', imageFile, imageFile.name)
 
   try {
@@ -1316,6 +1340,7 @@ const optimizeImageWithAi = async (): Promise<void> => {
       providerProfileId: selectedProvider.value?.isSavedProfile ? selectedProviderId.value : undefined,
       model: selectedModel.value,
       optimizationMode: selectedMode.value,
+      prompt: aiPrompt.value,
       imageDataUrl,
       imageName: imageFile.name
     }
@@ -1403,6 +1428,10 @@ const onImageSelected = async (event: Event): Promise<void> => {
   input.value = ''
 }
 
+const onAiImageSelected = async (event: Event): Promise<void> => {
+  await onImageSelected(event)
+}
+
 watch([selectedManufacturer, selectedBoardSize, inputMode, maxColors, enableDithering, enablePixelCleanup], () => {
   if (isApplyingProject) return
 
@@ -1415,6 +1444,8 @@ watch([selectedManufacturer, selectedBoardSize, inputMode, maxColors, enableDith
   if (!paletteColors.some((color) => color.hex === selectedColorHex.value)) {
     selectedColorHex.value = paletteColors[3]?.hex ?? paletteColors[0].hex
   }
+  isPalettePickerOpen.value = false
+  paletteSearchQuery.value = ''
 
   if (sourceFile.value) {
     void regeneratePattern()
@@ -1483,6 +1514,7 @@ const floodFill = (startIndex: number, nextColor: string): void => {
 }
 
 const onCellClick = (index: number): void => {
+  isPalettePickerOpen.value = false
   const currentColor = patternGrid.value.cells[index]
 
   if (activeTool.value === 'eyedropper') {
@@ -1607,7 +1639,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="flex h-screen flex-col bg-ink-50 text-ink-900 dark:bg-ink-900 dark:text-ink-50">
+  <div class="flex h-screen flex-col bg-ink-50 text-ink-900 dark:bg-ink-900 dark:text-ink-50" @click="closePalettePicker">
     <header
       class="flex h-16 shrink-0 items-center justify-between border-b border-ink-100 bg-white/82 px-5 dark:border-white/10 dark:bg-ink-800/78"
     >
@@ -1668,14 +1700,6 @@ onBeforeUnmount(() => {
           <Icon icon="ri:save-3-line" class="h-4 w-4" />
           <span>保存</span>
         </button>
-        <label
-          class="inline-flex cursor-pointer items-center gap-2 rounded-md bg-ink-900 px-3 py-2 text-sm font-medium text-white transition hover:bg-ink-800 dark:bg-ink-50 dark:text-ink-900 dark:hover:bg-white"
-          title="导入图片"
-        >
-          <Icon icon="ri:image-add-line" class="h-4 w-4" />
-          <span>{{ isGenerating ? '转换中' : '导入图片' }}</span>
-          <input class="hidden" type="file" accept="image/*" @change="onImageSelected" />
-        </label>
         <input
           ref="projectFileInput"
           class="hidden"
@@ -1711,104 +1735,106 @@ onBeforeUnmount(() => {
         <section
           class="tool-scroll min-h-0 overflow-auto rounded-md border border-ink-100 bg-white p-4 shadow-panel dark:border-white/10 dark:bg-ink-800"
         >
-          <div class="mb-4 flex items-center gap-2">
-            <Icon icon="ri:settings-3-line" class="h-5 w-5 text-bead-coral" />
-            <h3 class="text-sm font-semibold">图纸规格</h3>
-          </div>
+          <div>
+            <div class="mb-4 flex items-center gap-2">
+              <Icon icon="ri:settings-3-line" class="h-5 w-5 text-bead-coral" />
+              <h3 class="text-sm font-semibold">图纸规格</h3>
+            </div>
 
-          <div class="space-y-4">
-            <label class="block space-y-1.5">
-              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">厂商色卡</span>
-              <select
-                v-model="selectedManufacturer"
-                class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-mint dark:border-white/10 dark:bg-ink-900"
-              >
-                <option
-                  v-for="palette in manufacturerPalettes"
-                  :key="palette.id"
-                  :value="palette.id"
+            <div class="space-y-4">
+              <label class="block space-y-1.5">
+                <span class="text-xs font-medium text-ink-600 dark:text-ink-300">厂商色卡</span>
+                <select
+                  v-model="selectedManufacturer"
+                  class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-mint dark:border-white/10 dark:bg-ink-900"
                 >
-                  {{ palette.name }} · {{ palette.colors.length }} 色
-                </option>
-              </select>
-            </label>
+                  <option
+                    v-for="palette in manufacturerPalettes"
+                    :key="palette.id"
+                    :value="palette.id"
+                  >
+                    {{ palette.name }} · {{ palette.colors.length }} 色
+                  </option>
+                </select>
+              </label>
 
-            <label class="block space-y-1.5">
-              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">画板规格</span>
-              <select
-                v-model="selectedBoardSize"
-                class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-mint dark:border-white/10 dark:bg-ink-900"
+              <label class="block space-y-1.5">
+                <span class="text-xs font-medium text-ink-600 dark:text-ink-300">画板规格</span>
+                <select
+                  v-model="selectedBoardSize"
+                  class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-mint dark:border-white/10 dark:bg-ink-900"
+                >
+                  <option v-for="size in boardSizes" :key="size">{{ size }}</option>
+                </select>
+              </label>
+
+              <label class="block space-y-1.5">
+                <span class="text-xs font-medium text-ink-600 dark:text-ink-300">输入类型</span>
+                <select
+                  v-model="inputMode"
+                  class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-mint dark:border-white/10 dark:bg-ink-900"
+                >
+                  <option v-for="mode in inputModes" :key="mode.id" :value="mode.id">
+                    {{ mode.label }}
+                  </option>
+                </select>
+              </label>
+
+              <label class="block space-y-2">
+                <span class="flex items-center justify-between text-xs font-medium text-ink-600 dark:text-ink-300">
+                  <span>最大颜色数</span>
+                  <span>{{ maxColors }}</span>
+                </span>
+                <input
+                  v-model.number="maxColors"
+                  class="w-full accent-bead-coral"
+                  type="range"
+                  min="8"
+                  :max="activePaletteColors.length"
+                  step="1"
+                />
+              </label>
+
+              <label
+                class="flex items-center justify-between rounded-md border border-ink-100 px-3 py-2 dark:border-white/10"
               >
-                <option v-for="size in boardSizes" :key="size">{{ size }}</option>
-              </select>
-            </label>
+                <span class="text-sm">开启抖色</span>
+                <input v-model="enableDithering" class="h-4 w-4 accent-bead-mint" type="checkbox" />
+              </label>
 
-            <label class="block space-y-1.5">
-              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">输入类型</span>
-              <select
-                v-model="inputMode"
-                class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-mint dark:border-white/10 dark:bg-ink-900"
+              <label
+                class="flex items-center justify-between rounded-md border border-ink-100 px-3 py-2 dark:border-white/10"
               >
-                <option v-for="mode in inputModes" :key="mode.id" :value="mode.id">
-                  {{ mode.label }}
-                </option>
-              </select>
-            </label>
+                <span class="text-sm">像素清理</span>
+                <input v-model="enablePixelCleanup" class="h-4 w-4 accent-bead-amber" type="checkbox" />
+              </label>
 
-            <label class="block space-y-2">
-              <span class="flex items-center justify-between text-xs font-medium text-ink-600 dark:text-ink-300">
-                <span>最大颜色数</span>
-                <span>{{ maxColors }}</span>
-              </span>
-              <input
-                v-model.number="maxColors"
-                class="w-full accent-bead-coral"
-                type="range"
-                min="8"
-                :max="activePaletteColors.length"
-                step="1"
-              />
-            </label>
-
-            <label
-              class="flex items-center justify-between rounded-md border border-ink-100 px-3 py-2 dark:border-white/10"
-            >
-              <span class="text-sm">开启抖色</span>
-              <input v-model="enableDithering" class="h-4 w-4 accent-bead-mint" type="checkbox" />
-            </label>
-
-            <label
-              class="flex items-center justify-between rounded-md border border-ink-100 px-3 py-2 dark:border-white/10"
-            >
-              <span class="text-sm">像素清理</span>
-              <input v-model="enablePixelCleanup" class="h-4 w-4 accent-bead-amber" type="checkbox" />
-            </label>
-
-            <label
-              class="flex items-center justify-between rounded-md border border-ink-100 px-3 py-2 dark:border-white/10"
-            >
-              <span class="text-sm">显示标号</span>
-              <input v-model="showGridLabels" class="h-4 w-4 accent-bead-sky" type="checkbox" />
-            </label>
-
-            <div class="rounded-md border border-ink-100 p-3 text-xs dark:border-white/10">
-              <span class="block text-ink-500 dark:text-ink-400">来源</span>
-              <strong class="mt-1 block truncate">{{ patternGrid.sourceName }}</strong>
-              <span
-                class="mt-2 block text-ink-600 dark:text-ink-300"
-                :class="generationError ? 'text-bead-coral' : ''"
+              <label
+                class="flex items-center justify-between rounded-md border border-ink-100 px-3 py-2 dark:border-white/10"
               >
-                {{ generationError || generationMessage }}
-              </span>
-              <span class="mt-1 block text-ink-500 dark:text-ink-400">
-                {{ projectStatus }}
-              </span>
-              <span
-                v-if="inputMode === 'pixel-art'"
-                class="mt-2 block text-bead-sky"
-              >
-                像素画模式：按格采样并匹配色卡
-              </span>
+                <span class="text-sm">显示标号</span>
+                <input v-model="showGridLabels" class="h-4 w-4 accent-bead-sky" type="checkbox" />
+              </label>
+
+              <div class="rounded-md border border-ink-100 p-3 text-xs dark:border-white/10">
+                <span class="block text-ink-500 dark:text-ink-400">来源</span>
+                <strong class="mt-1 block truncate">{{ patternGrid.sourceName }}</strong>
+                <span
+                  class="mt-2 block text-ink-600 dark:text-ink-300"
+                  :class="generationError ? 'text-bead-coral' : ''"
+                >
+                  {{ generationError || generationMessage }}
+                </span>
+                <span class="mt-1 block text-ink-500 dark:text-ink-400">
+                  {{ projectStatus }}
+                </span>
+                <span
+                  v-if="inputMode === 'pixel-art'"
+                  class="mt-2 block text-bead-sky"
+                >
+                  像素画模式：按格采样并匹配色卡
+                </span>
+              </div>
             </div>
           </div>
 
@@ -1829,7 +1855,7 @@ onBeforeUnmount(() => {
               </button>
             </div>
 
-            <div class="max-h-56 overflow-auto rounded-md border border-ink-100 dark:border-white/10">
+            <div class="rounded-md border border-ink-100 dark:border-white/10">
               <div
                 v-for="item in beadInventory"
                 :key="item.hex"
@@ -1966,14 +1992,82 @@ onBeforeUnmount(() => {
 
           <div class="border-t border-ink-100 px-4 py-3 dark:border-white/10">
             <div class="flex min-w-0 items-center gap-3">
-              <div class="flex shrink-0 items-center gap-2">
+              <div class="relative flex shrink-0 items-center gap-2">
                 <Icon icon="ri:palette-line" class="h-4 w-4 text-bead-violet" />
                 <span class="text-xs font-semibold text-ink-600 dark:text-ink-300">当前用色</span>
-                <span
-                  class="h-4 w-4 rounded-full border border-ink-200 dark:border-white/10"
-                  :style="{ backgroundColor: selectedColorHex }"
-                  :title="selectedColor.name"
-                ></span>
+                <button
+                  class="inline-flex h-9 max-w-44 items-center gap-2 rounded-md border border-ink-200 bg-white px-2.5 text-left text-xs transition hover:border-ink-300 hover:bg-ink-50 dark:border-white/10 dark:bg-ink-800 dark:hover:bg-white/5"
+                  :class="isPalettePickerOpen ? 'border-bead-violet ring-2 ring-bead-violet/20' : ''"
+                  type="button"
+                  :title="`从 ${activeManufacturerPalette.name} 色卡选择颜色`"
+                  @click.stop="isPalettePickerOpen = !isPalettePickerOpen"
+                >
+                  <span
+                    class="h-5 w-5 shrink-0 rounded border border-ink-200 dark:border-white/10"
+                    :style="{ backgroundColor: selectedColorHex }"
+                  ></span>
+                  <span class="min-w-0">
+                    <span class="block truncate font-semibold text-ink-800 dark:text-ink-100">{{ selectedColor.id }}</span>
+                    <span class="block truncate text-[10px] text-ink-500 dark:text-ink-400">{{ selectedColor.name }}</span>
+                  </span>
+                  <Icon icon="ri:arrow-down-s-line" class="h-4 w-4 shrink-0 text-ink-500 dark:text-ink-400" />
+                </button>
+
+                <div
+                  v-if="isPalettePickerOpen"
+                  class="absolute bottom-11 left-0 z-30 w-[min(34rem,calc(100vw-2rem))] rounded-md border border-ink-100 bg-white shadow-panel dark:border-white/10 dark:bg-ink-800"
+                  @click.stop
+                >
+                  <div class="flex items-center gap-2 border-b border-ink-100 p-3 dark:border-white/10">
+                    <Icon icon="ri:search-line" class="h-4 w-4 shrink-0 text-ink-500 dark:text-ink-400" />
+                    <input
+                      v-model="paletteSearchQuery"
+                      class="h-9 min-w-0 flex-1 rounded-md border border-ink-100 bg-ink-50 px-3 text-sm outline-none transition focus:border-bead-violet dark:border-white/10 dark:bg-ink-900"
+                      type="search"
+                      placeholder="搜索编号、名称或 HEX"
+                    />
+                    <button
+                      class="rounded-md p-2 text-ink-500 transition hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10"
+                      type="button"
+                      title="关闭色卡"
+                      @click="isPalettePickerOpen = false"
+                    >
+                      <Icon icon="ri:close-line" class="h-4 w-4" />
+                    </button>
+                  </div>
+
+                  <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs text-ink-500 dark:text-ink-400">
+                    <span class="truncate">{{ activeManufacturerPalette.name }} · {{ filteredPaletteColors.length }} / {{ activePaletteColors.length }} 色</span>
+                    <span class="shrink-0 truncate">{{ selectedColorLabel }}</span>
+                  </div>
+
+                  <div class="tool-scroll grid max-h-80 grid-cols-[repeat(auto-fill,minmax(4.75rem,1fr))] gap-2 overflow-y-auto px-3 pb-3">
+                    <button
+                      v-for="color in filteredPaletteColors"
+                      :key="color.id"
+                      type="button"
+                      class="min-h-20 rounded-md border p-2 text-left text-[11px] transition hover:border-ink-300 hover:bg-ink-50 dark:border-white/10 dark:hover:bg-white/5"
+                      :class="
+                        selectedColorHex === color.hex
+                          ? 'border-bead-coral bg-bead-coral/10 ring-2 ring-bead-coral/20'
+                          : 'border-ink-100'
+                      "
+                      :title="`${color.id} ${color.name} ${color.hex}`"
+                      @click="selectPaletteColor(color.hex)"
+                    >
+                      <span class="block h-7 rounded border border-ink-100 dark:border-white/10" :style="{ backgroundColor: color.hex }"></span>
+                      <span class="mt-1 block truncate font-semibold text-ink-800 dark:text-ink-100">{{ color.id }}</span>
+                      <span class="block truncate text-ink-500 dark:text-ink-400">{{ color.name }}</span>
+                      <span v-if="usedColorCounts.get(color.hex)" class="mt-1 block text-[10px] text-bead-violet">
+                        已用 {{ usedColorCounts.get(color.hex) }}
+                      </span>
+                    </button>
+                  </div>
+
+                  <div v-if="filteredPaletteColors.length === 0" class="px-3 pb-3 text-sm text-ink-500 dark:text-ink-400">
+                    没有匹配的颜色
+                  </div>
+                </div>
               </div>
               <div class="tool-scroll flex min-w-0 flex-1 gap-2 overflow-x-auto pb-1">
                 <button
@@ -1987,7 +2081,7 @@ onBeforeUnmount(() => {
                       : 'border-ink-100'
                   "
                   :title="`${color.id} ${color.name}`"
-                  @click="selectedColorHex = color.hex"
+                  @click="selectPaletteColor(color.hex)"
                 >
                   <span class="h-8 w-8 rounded border border-ink-100 dark:border-white/10" :style="{ backgroundColor: color.hex }"></span>
                   <span class="min-w-0">
@@ -2032,137 +2126,36 @@ onBeforeUnmount(() => {
         <section
           class="tool-scroll min-h-0 overflow-auto rounded-md border border-ink-100 bg-white p-4 shadow-panel dark:border-white/10 dark:bg-ink-800"
         >
-          <div class="mb-4 flex items-center gap-2">
-            <Icon icon="ri:robot-2-line" class="h-5 w-5 text-bead-sky" />
-            <h3 class="text-sm font-semibold">AI 平台</h3>
+          <div class="mb-4 flex items-center justify-between gap-3">
+            <div class="flex min-w-0 items-center gap-2">
+              <Icon icon="ri:robot-2-line" class="h-5 w-5 text-bead-sky" />
+              <h3 class="text-sm font-semibold">AI 创作</h3>
+            </div>
+            <button
+              class="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-ink-200 px-2.5 py-1.5 text-xs text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+              type="button"
+              title="AI 设置"
+              @click="isAiSettingsOpen = true"
+            >
+              <Icon icon="ri:settings-4-line" class="h-3.5 w-3.5" />
+              <span>设置</span>
+            </button>
           </div>
 
           <form class="space-y-4" @submit.prevent>
-            <input
-              autocomplete="username"
-              class="hidden"
-              tabindex="-1"
-              type="text"
-              value="ai-provider"
-            />
-
-            <label class="block space-y-1.5">
-              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">供应商档案</span>
-              <select
-                v-model="selectedProviderId"
-                class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
-                @change="onProviderChange"
-              >
-                <option v-for="provider in aiProviderOptions" :key="provider.id" :value="provider.id">
-                  {{ provider.name }}{{ provider.isSavedProfile ? ' · 已保存' : '' }}
-                </option>
-              </select>
-            </label>
-
-            <label class="block space-y-1.5">
-              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">档案名称</span>
-              <input
-                v-model="providerName"
-                class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
-                type="text"
-              />
-            </label>
-
-            <label class="block space-y-1.5">
-              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">Base URL</span>
-              <input
-                v-model="baseUrl"
-                class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
-                type="url"
-              />
-            </label>
-
-            <label class="block space-y-1.5">
-              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">API Key</span>
-              <input
-                v-model="apiKey"
-                class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
-                autocomplete="new-password"
-                :placeholder="selectedProviderHasStoredKey ? '已安全保存，可留空' : 'sk-...'"
-                type="password"
-              />
-            </label>
-
-            <div class="grid grid-cols-2 gap-2">
-              <button
-                class="inline-flex items-center justify-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 disabled:opacity-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-                type="button"
-                title="保存供应商档案"
-                :disabled="isSavingProvider"
-                @click="saveProviderProfile"
-              >
-                <Icon icon="ri:save-3-line" class="h-4 w-4" :class="isSavingProvider ? 'animate-spin' : ''" />
-                <span>保存档案</span>
-              </button>
-              <button
-                class="inline-flex items-center justify-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 disabled:opacity-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-                type="button"
-                title="删除供应商档案"
-                :disabled="!selectedProvider.isSavedProfile || isDeletingProvider"
-                @click="deleteProviderProfile"
-              >
-                <Icon icon="ri:delete-bin-line" class="h-4 w-4" :class="isDeletingProvider ? 'animate-spin' : ''" />
-                <span>删除</span>
-              </button>
-            </div>
-
-            <p
-              v-if="providerStatus || providerError || (isDesktopAiRuntime && !secureStorageAvailable)"
-              class="rounded-md border px-3 py-2 text-xs"
-              :class="
-                providerError || (isDesktopAiRuntime && !secureStorageAvailable)
-                  ? 'border-bead-coral/30 bg-bead-coral/10 text-bead-coral'
-                  : 'border-bead-sky/30 bg-bead-sky/10 text-ink-700 dark:text-ink-100'
-              "
+            <label
+              class="flex cursor-pointer flex-col items-center justify-center rounded-md border border-dashed border-ink-200 bg-ink-50 px-3 py-6 text-center transition hover:border-bead-sky hover:bg-bead-sky/5 dark:border-white/10 dark:bg-ink-900 dark:hover:bg-bead-sky/10"
+              title="上传 AI 参考图片"
             >
-              {{
-                providerError ||
-                (!secureStorageAvailable ? '当前系统安全存储不可用，API Key 未保存' : providerStatus)
-              }}
-            </p>
-
-            <div class="grid grid-cols-[1fr_auto] gap-2">
-              <label class="block space-y-1.5">
-                <span class="text-xs font-medium text-ink-600 dark:text-ink-300">模型</span>
-                <select
-                  v-model="selectedModel"
-                  class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
-                >
-                  <option v-for="model in modelOptions" :key="model">{{ model }}</option>
-                </select>
-              </label>
-
-              <button
-                class="mt-5 inline-flex h-10 items-center justify-center rounded-md border border-ink-200 px-3 text-sm text-ink-700 transition hover:bg-ink-50 disabled:opacity-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-                type="button"
-                title="拉取模型"
-                :disabled="isFetchingModels"
-                @click="fetchModels"
-              >
-                <Icon
-                  icon="ri:refresh-line"
-                  class="h-4 w-4"
-                  :class="isFetchingModels ? 'animate-spin' : ''"
-                />
-              </button>
-            </div>
-
-            <p
-              v-if="modelStatus || modelError"
-              class="rounded-md border px-3 py-2 text-xs"
-              :class="
-                modelError
-                  ? 'border-bead-coral/30 bg-bead-coral/10 text-bead-coral'
-                  : 'border-bead-mint/30 bg-bead-mint/10 text-ink-700 dark:text-ink-100'
-              "
-            >
-              {{ modelError || modelStatus }}
-            </p>
+              <Icon icon="ri:image-add-line" class="h-8 w-8 text-bead-sky" />
+              <span class="mt-2 text-sm font-semibold text-ink-800 dark:text-ink-100">
+                {{ sourceFile ? '更换图片' : '上传图片' }}
+              </span>
+              <span class="mt-1 block max-w-full truncate text-xs text-ink-500 dark:text-ink-400">
+                {{ sourceFile?.name || patternGrid.sourceName }}
+              </span>
+              <input class="hidden" type="file" accept="image/*" @change="onAiImageSelected" />
+            </label>
 
             <label class="block space-y-1.5">
               <span class="text-xs font-medium text-ink-600 dark:text-ink-300">优化模式</span>
@@ -2172,6 +2165,15 @@ onBeforeUnmount(() => {
               >
                 <option v-for="mode in optimizationModes" :key="mode">{{ mode }}</option>
               </select>
+            </label>
+
+            <label class="block space-y-1.5">
+              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">提示词</span>
+              <textarea
+                v-model="aiPrompt"
+                class="min-h-32 w-full resize-y rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
+                placeholder="例如：保留主体轮廓，简化背景，把颜色压成清晰的大色块"
+              ></textarea>
             </label>
 
             <button
@@ -2199,31 +2201,181 @@ onBeforeUnmount(() => {
           </form>
 
           <div class="mt-6 border-t border-ink-100 pt-4 dark:border-white/10">
-            <div class="mb-3 flex items-center gap-2">
-              <Icon icon="ri:list-check-3" class="h-5 w-5 text-bead-amber" />
-              <h3 class="text-sm font-semibold">模型能力</h3>
-            </div>
-            <div class="flex flex-wrap gap-2">
+            <div class="space-y-3 text-xs">
+              <div>
+                <span class="block text-ink-500 dark:text-ink-400">供应商</span>
+                <strong class="mt-1 block truncate">{{ selectedProvider.name }}</strong>
+              </div>
+              <div>
+                <span class="block text-ink-500 dark:text-ink-400">模型</span>
+                <strong class="mt-1 block truncate">{{ selectedModel || '未选择' }}</strong>
+              </div>
               <button
-                v-for="capability in capabilityOptions"
-                :key="capability.id"
-                class="inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs transition"
-                :class="
-                  selectedModelCapabilities.includes(capability.id)
-                    ? 'border-bead-sky/50 bg-bead-sky/15 text-ink-900 dark:text-ink-50'
-                    : 'border-ink-200 text-ink-600 hover:bg-ink-50 dark:border-white/10 dark:text-ink-300 dark:hover:bg-white/5'
-                "
+                class="inline-flex w-full items-center justify-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
                 type="button"
-                :title="capability.label"
-                @click="toggleSelectedModelCapability(capability.id)"
+                title="AI 设置"
+                @click="isAiSettingsOpen = true"
               >
-                <Icon :icon="capability.icon" class="h-3.5 w-3.5" />
-                <span>{{ capability.label }}</span>
+                <Icon icon="ri:settings-4-line" class="h-4 w-4" />
+                <span>配置 AI 对接</span>
               </button>
             </div>
           </div>
         </section>
       </div>
     </main>
+
+    <div
+      v-if="isAiSettingsOpen"
+      class="fixed inset-0 z-40 flex items-center justify-center bg-ink-900/45 p-4"
+    >
+      <section
+        class="flex max-h-[min(46rem,calc(100vh-2rem))] w-full max-w-2xl flex-col rounded-md border border-ink-100 bg-white shadow-panel dark:border-white/10 dark:bg-ink-800"
+      >
+        <div class="flex items-center justify-between gap-3 border-b border-ink-100 px-5 py-4 dark:border-white/10">
+          <div class="flex min-w-0 items-center gap-2">
+            <Icon icon="ri:settings-4-line" class="h-5 w-5 text-bead-sky" />
+            <h3 class="truncate text-sm font-semibold">AI 设置</h3>
+          </div>
+          <button
+            class="rounded-md p-2 text-ink-500 transition hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10"
+            type="button"
+            title="关闭"
+            @click="isAiSettingsOpen = false"
+          >
+            <Icon icon="ri:close-line" class="h-4 w-4" />
+          </button>
+        </div>
+
+        <form class="tool-scroll min-h-0 space-y-4 overflow-auto px-5 py-4" @submit.prevent>
+          <input
+            autocomplete="username"
+            class="hidden"
+            tabindex="-1"
+            type="text"
+            value="ai-provider"
+          />
+
+          <label class="block space-y-1.5">
+            <span class="text-xs font-medium text-ink-600 dark:text-ink-300">供应商档案</span>
+            <select
+              v-model="selectedProviderId"
+              class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
+              @change="onProviderChange"
+            >
+              <option v-for="provider in aiProviderOptions" :key="provider.id" :value="provider.id">
+                {{ provider.name }}{{ provider.isSavedProfile ? ' · 已保存' : '' }}
+              </option>
+            </select>
+          </label>
+
+          <label class="block space-y-1.5">
+            <span class="text-xs font-medium text-ink-600 dark:text-ink-300">档案名称</span>
+            <input
+              v-model="providerName"
+              class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
+              type="text"
+            />
+          </label>
+
+          <label class="block space-y-1.5">
+            <span class="text-xs font-medium text-ink-600 dark:text-ink-300">Base URL</span>
+            <input
+              v-model="baseUrl"
+              class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
+              type="url"
+            />
+          </label>
+
+          <label class="block space-y-1.5">
+            <span class="text-xs font-medium text-ink-600 dark:text-ink-300">API Key</span>
+            <input
+              v-model="apiKey"
+              class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
+              autocomplete="new-password"
+              :placeholder="selectedProviderHasStoredKey ? '已安全保存，可留空' : 'sk-...'"
+              type="password"
+            />
+          </label>
+
+          <div class="grid grid-cols-2 gap-2">
+            <button
+              class="inline-flex items-center justify-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 disabled:opacity-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+              type="button"
+              title="保存供应商档案"
+              :disabled="isSavingProvider"
+              @click="saveProviderProfile"
+            >
+              <Icon icon="ri:save-3-line" class="h-4 w-4" :class="isSavingProvider ? 'animate-spin' : ''" />
+              <span>保存档案</span>
+            </button>
+            <button
+              class="inline-flex items-center justify-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 disabled:opacity-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+              type="button"
+              title="删除供应商档案"
+              :disabled="!selectedProvider.isSavedProfile || isDeletingProvider"
+              @click="deleteProviderProfile"
+            >
+              <Icon icon="ri:delete-bin-line" class="h-4 w-4" :class="isDeletingProvider ? 'animate-spin' : ''" />
+              <span>删除</span>
+            </button>
+          </div>
+
+          <p
+            v-if="providerStatus || providerError || (isDesktopAiRuntime && !secureStorageAvailable)"
+            class="rounded-md border px-3 py-2 text-xs"
+            :class="
+              providerError || (isDesktopAiRuntime && !secureStorageAvailable)
+                ? 'border-bead-coral/30 bg-bead-coral/10 text-bead-coral'
+                : 'border-bead-sky/30 bg-bead-sky/10 text-ink-700 dark:text-ink-100'
+            "
+          >
+            {{
+              providerError ||
+              (!secureStorageAvailable ? '当前系统安全存储不可用，API Key 未保存' : providerStatus)
+            }}
+          </p>
+
+          <div class="grid grid-cols-[1fr_auto] gap-2">
+            <label class="block space-y-1.5">
+              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">模型</span>
+              <select
+                v-model="selectedModel"
+                class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
+              >
+                <option v-for="model in modelOptions" :key="model">{{ model }}</option>
+              </select>
+            </label>
+
+            <button
+              class="inline-flex h-10 w-10 self-end items-center justify-center rounded-md border border-ink-200 text-sm text-ink-700 transition hover:bg-ink-50 disabled:opacity-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+              type="button"
+              title="拉取模型"
+              :disabled="isFetchingModels"
+              @click="fetchModels"
+            >
+              <Icon
+                icon="ri:refresh-line"
+                class="h-4 w-4"
+                :class="isFetchingModels ? 'animate-spin' : ''"
+              />
+            </button>
+          </div>
+
+          <p
+            v-if="modelStatus || modelError"
+            class="rounded-md border px-3 py-2 text-xs"
+            :class="
+              modelError
+                ? 'border-bead-coral/30 bg-bead-coral/10 text-bead-coral'
+                : 'border-bead-mint/30 bg-bead-mint/10 text-ink-700 dark:text-ink-100'
+            "
+          >
+            {{ modelError || modelStatus }}
+          </p>
+
+        </form>
+      </section>
+    </div>
   </div>
 </template>

@@ -66,13 +66,15 @@ const createWindow = (): void => {
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#191715' : '#f8f7f4',
     show: false,
     title: 'Perler Beads Studio',
+    autoHideMenuBar: true,
     webPreferences: {
-      preload: join(__dirname, '../preload/index.js'),
+      preload: join(__dirname, '../preload/index.mjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false
     }
   })
+  mainWindow.setMenu(null)
 
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show()
@@ -117,6 +119,7 @@ const isAiImageOptimizationRequest = (value: unknown): value is AiImageOptimizat
     typeof value.model === 'string' &&
     typeof value.optimizationMode === 'string' &&
     typeof value.imageDataUrl === 'string' &&
+    (value.prompt === undefined || typeof value.prompt === 'string') &&
     (value.imageName === undefined || typeof value.imageName === 'string')
   )
 }
@@ -544,7 +547,7 @@ const registerAiIpc = (): void => {
       const imageBlob = new Blob([new Uint8Array(image.buffer)], { type: image.mimeType })
 
       body.append('model', request.model.trim())
-      body.append('prompt', createAiImageOptimizationPrompt(request.optimizationMode))
+      body.append('prompt', createAiImageOptimizationPrompt(request.optimizationMode, request.prompt))
       body.append('image', imageBlob, request.imageName?.trim() || 'source-image.png')
 
       try {

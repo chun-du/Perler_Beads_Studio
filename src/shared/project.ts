@@ -22,6 +22,7 @@ export interface SavedProject {
     baseUrl: string
     modelId: string
     optimizationMode: string
+    prompt?: string
   }
 }
 
