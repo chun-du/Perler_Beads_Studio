@@ -6,6 +6,7 @@ export interface SavedProject {
     manufacturer: string
     boardSize: string
     maxColors: number
+    inputMode: 'image' | 'pixel-art'
     dithering: boolean
     cleanup: boolean
     showLabels: boolean

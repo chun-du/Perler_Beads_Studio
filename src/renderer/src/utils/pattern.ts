@@ -12,6 +12,7 @@ export interface PatternGenerationOptions {
   maxColors: number
   dithering: boolean
   cleanup: boolean
+  inputMode: 'image' | 'pixel-art'
   palette: BeadColor[]
 }
 
@@ -511,6 +512,7 @@ export const createPatternFromImageDataUrl = async (
 
   canvas.width = columns
   canvas.height = rows
+  context.imageSmoothingEnabled = options.inputMode !== 'pixel-art'
 
   const sourceRatio = image.width / image.height
   const targetRatio = columns / rows
@@ -527,14 +529,47 @@ export const createPatternFromImageDataUrl = async (
     sy = (image.height - sh) / 2
   }
 
-  context.drawImage(image, sx, sy, sw, sh, 0, 0, columns, rows)
+  if (options.inputMode === 'pixel-art') {
+    const sampleCanvas = document.createElement('canvas')
+    const sampleContext = sampleCanvas.getContext('2d', { willReadFrequently: true })
+
+    if (!sampleContext) {
+      throw new Error('当前环境不支持 Canvas')
+    }
+
+    sampleCanvas.width = image.width
+    sampleCanvas.height = image.height
+    sampleContext.imageSmoothingEnabled = false
+    sampleContext.drawImage(image, 0, 0)
+
+    const sampleData = sampleContext.getImageData(0, 0, image.width, image.height)
+    const targetImageData = context.createImageData(columns, rows)
+
+    for (let y = 0; y < rows; y += 1) {
+      for (let x = 0; x < columns; x += 1) {
+        const sourceX = Math.min(image.width - 1, Math.max(0, Math.floor(sx + ((x + 0.5) / columns) * sw)))
+        const sourceY = Math.min(image.height - 1, Math.max(0, Math.floor(sy + ((y + 0.5) / rows) * sh)))
+        const sourceIndex = (sourceY * image.width + sourceX) * 4
+        const targetIndex = (y * columns + x) * 4
+
+        targetImageData.data[targetIndex] = sampleData.data[sourceIndex]
+        targetImageData.data[targetIndex + 1] = sampleData.data[sourceIndex + 1]
+        targetImageData.data[targetIndex + 2] = sampleData.data[sourceIndex + 2]
+        targetImageData.data[targetIndex + 3] = sampleData.data[sourceIndex + 3]
+      }
+    }
+
+    context.putImageData(targetImageData, 0, 0)
+  } else {
+    context.drawImage(image, sx, sy, sw, sh, 0, 0, columns, rows)
+  }
 
   const imageData = context.getImageData(0, 0, columns, rows)
   const rgbPalette = options.palette.map((color) => parseHex(color.hex))
   const activePalette = selectPaletteForImage(imageData, rgbPalette, options.maxColors)
   const cells: string[] = new Array(columns * rows)
 
-  if (options.dithering) {
+  if (options.dithering && options.inputMode !== 'pixel-art') {
     const data = new Float32Array(imageData.data)
 
     for (let index = 0; index < data.length; index += 4) {
@@ -585,7 +620,7 @@ export const createPatternFromImageDataUrl = async (
   return {
     columns,
     rows,
-    cells: options.cleanup ? cleanupPatternCells(cells, columns, rows) : cells,
+    cells: options.cleanup && options.inputMode !== 'pixel-art' ? cleanupPatternCells(cells, columns, rows) : cells,
     sourceName
   }
 }

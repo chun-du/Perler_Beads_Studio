@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import type {
@@ -17,7 +17,7 @@ import {
   getManufacturerPalette,
   manufacturerPalettes
 } from './data/palettes'
-import { aiProviderPresets, workflowSteps } from './data/studio'
+import { aiProviderPresets } from './data/studio'
 import {
   buildBeadInventory,
   createPatternFromImageFile,
@@ -34,6 +34,17 @@ import {
 import type { PatternGrid } from './utils/pattern'
 
 type EditorTool = 'pencil' | 'fill' | 'eyedropper' | 'eraser'
+type PatternInputMode = 'image' | 'pixel-art'
+
+interface CanvasPointerState {
+  pointerId: number
+  button: number
+  isPanMode: boolean
+  startClientX: number
+  startClientY: number
+  startPanX: number
+  startPanY: number
+}
 
 interface AiProviderOption {
   id: string
@@ -50,6 +61,10 @@ const { preference, resolvedTheme, setPreference, cycleTheme } = useTheme()
 
 const boardSizes = ['32 x 32', '48 x 48', '64 x 64', '96 x 96']
 const optimizationModes = ['主体增强', '去背景', '像素画参考', '低色数简化']
+const inputModes: Array<{ id: PatternInputMode; label: string }> = [
+  { id: 'image', label: '普通图片' },
+  { id: 'pixel-art', label: '像素画输入' }
+]
 const editorTools: Array<{ id: EditorTool; icon: string; label: string }> = [
   { id: 'pencil', icon: 'ri:paint-brush-line', label: '画笔' },
   { id: 'fill', icon: 'ri:paint-fill', label: '填充' },
@@ -59,6 +74,7 @@ const editorTools: Array<{ id: EditorTool; icon: string; label: string }> = [
 
 const selectedManufacturer = ref(defaultManufacturerId)
 const selectedBoardSize = ref(boardSizes[1])
+const inputMode = ref<PatternInputMode>('image')
 const maxColors = ref(24)
 const enableDithering = ref(true)
 const enablePixelCleanup = ref(true)
@@ -86,11 +102,21 @@ const undoStack = ref<string[][]>([])
 const redoStack = ref<string[][]>([])
 const projectFileInput = ref<HTMLInputElement | null>(null)
 const patternPreviewPanel = ref<HTMLElement | null>(null)
+const patternCanvasStage = ref<HTMLDivElement | null>(null)
+const patternCanvasShell = ref<HTMLDivElement | null>(null)
 const patternCanvas = ref<HTMLCanvasElement | null>(null)
 const patternCanvasFrame = ref<HTMLDivElement | null>(null)
 const projectStatus = ref('尚未保存')
 const isPatternFullscreen = ref(false)
 const isPatternOverlayFullscreen = ref(false)
+const canvasZoom = ref(1)
+const canvasPanX = ref(0)
+const canvasPanY = ref(0)
+const canvasBaseSize = ref(420)
+const canvasPointerState = ref<CanvasPointerState | null>(null)
+const isCanvasDragging = ref(false)
+const isSpacePressed = ref(false)
+const isCanvasStageHovered = ref(false)
 let generationToken = 0
 let isApplyingProject = false
 let canvasResizeObserver: ResizeObserver | null = null
@@ -169,8 +195,22 @@ const patternStatus = computed(() => {
 
 const beadInventory = computed(() => buildBeadInventory(patternGrid.value, activePaletteColors.value))
 const usedColors = computed(() => beadInventory.value)
+const actualUsedColorCount = computed(() => {
+  return new Set(patternGrid.value.cells.filter((color) => !isEmptyCell(color))).size
+})
 
 const displayedColors = computed(() => beadInventory.value.slice(0, 9))
+const canvasZoomPercent = computed(() => Math.round(canvasZoom.value * 100))
+const canvasCursorClass = computed(() => {
+  if (isCanvasDragging.value) return 'cursor-grabbing'
+  if (isSpacePressed.value) return 'cursor-grab'
+  return 'cursor-crosshair'
+})
+const canvasShellStyle = computed(() => ({
+  width: `${canvasBaseSize.value}px`,
+  height: `${canvasBaseSize.value}px`,
+  transform: `translate3d(${canvasPanX.value}px, ${canvasPanY.value}px, 0) scale(${canvasZoom.value})`
+}))
 
 const selectedColor = computed(() => {
   return activePaletteColors.value.find((color) => color.hex === selectedColorHex.value) ?? activePaletteColors.value[0]
@@ -350,8 +390,15 @@ const getPatternGenerationOptions = () => ({
   maxColors: maxColors.value,
   dithering: enableDithering.value,
   cleanup: enablePixelCleanup.value,
+  inputMode: inputMode.value,
   palette: activePaletteColors.value
 })
+
+const MIN_CANVAS_ZOOM = 0.5
+const MAX_CANVAS_ZOOM = 8
+const CANVAS_ZOOM_STEP = 1.25
+const CANVAS_DRAG_THRESHOLD = 3
+const CANVAS_MIN_VISIBLE_SIZE = 48
 
 interface CanvasMetrics {
   canvasSize: number
@@ -377,6 +424,131 @@ const getCanvasMetrics = (canvasSize: number): CanvasMetrics => {
     cellSize: gridSize / Math.max(1, previewColumns.value),
     labelSize,
     padding
+  }
+}
+
+const clampNumber = (value: number, minimum: number, maximum: number): number => {
+  return Math.min(maximum, Math.max(minimum, value))
+}
+
+const clampCanvasZoom = (zoom: number): number => {
+  return clampNumber(Number.isFinite(zoom) ? zoom : 1, MIN_CANVAS_ZOOM, MAX_CANVAS_ZOOM)
+}
+
+const getClampedCanvasPan = (
+  panX: number,
+  panY: number,
+  zoom: number,
+  stageWidth: number,
+  stageHeight: number,
+  shellWidth: number,
+  shellHeight: number
+): { x: number; y: number } => {
+  const scaledShellWidth = shellWidth * zoom
+  const scaledShellHeight = shellHeight * zoom
+  const minimumVisibleX = Math.min(CANVAS_MIN_VISIBLE_SIZE, stageWidth, scaledShellWidth)
+  const minimumVisibleY = Math.min(CANVAS_MIN_VISIBLE_SIZE, stageHeight, scaledShellHeight)
+  const maximumPanX = Math.max(0, (stageWidth + scaledShellWidth) / 2 - minimumVisibleX)
+  const maximumPanY = Math.max(0, (stageHeight + scaledShellHeight) / 2 - minimumVisibleY)
+
+  return {
+    x: clampNumber(panX, -maximumPanX, maximumPanX),
+    y: clampNumber(panY, -maximumPanY, maximumPanY)
+  }
+}
+
+const getCanvasViewportMetrics = (): {
+  stageWidth: number
+  stageHeight: number
+  shellWidth: number
+  shellHeight: number
+} => {
+  const stageRect = patternCanvasStage.value?.getBoundingClientRect()
+  const shellRect = patternCanvasShell.value?.getBoundingClientRect()
+
+  return {
+    stageWidth: Math.max(1, stageRect?.width ?? 1),
+    stageHeight: Math.max(1, stageRect?.height ?? 1),
+    shellWidth: Math.max(1, (shellRect?.width ?? 1) / canvasZoom.value),
+    shellHeight: Math.max(1, (shellRect?.height ?? 1) / canvasZoom.value)
+  }
+}
+
+const updateCanvasBaseSize = (): void => {
+  const stageRect = patternCanvasStage.value?.getBoundingClientRect()
+  if (!stageRect) return
+
+  canvasBaseSize.value = Math.max(180, Math.floor(Math.min(stageRect.width, stageRect.height) - 64))
+}
+
+const setCanvasViewport = (zoom: number, panX = canvasPanX.value, panY = canvasPanY.value): void => {
+  const nextZoom = clampCanvasZoom(zoom)
+  const metrics = getCanvasViewportMetrics()
+  const nextPan = getClampedCanvasPan(
+    panX,
+    panY,
+    nextZoom,
+    metrics.stageWidth,
+    metrics.stageHeight,
+    metrics.shellWidth,
+    metrics.shellHeight
+  )
+
+  canvasZoom.value = nextZoom
+  canvasPanX.value = nextPan.x
+  canvasPanY.value = nextPan.y
+}
+
+const resetCanvasViewport = (): void => {
+  setCanvasViewport(1, 0, 0)
+}
+
+const zoomCanvasAtPoint = (zoom: number, clientX?: number, clientY?: number): void => {
+  const stage = patternCanvasStage.value
+  const nextZoom = clampCanvasZoom(zoom)
+
+  if (!stage) {
+    setCanvasViewport(nextZoom)
+    return
+  }
+
+  const rect = stage.getBoundingClientRect()
+  const viewportX = clientX === undefined ? rect.width / 2 : clampNumber(clientX - rect.left, 0, rect.width)
+  const viewportY = clientY === undefined ? rect.height / 2 : clampNumber(clientY - rect.top, 0, rect.height)
+  const sourceX = (viewportX - rect.width / 2 - canvasPanX.value) / canvasZoom.value
+  const sourceY = (viewportY - rect.height / 2 - canvasPanY.value) / canvasZoom.value
+  const nextPanX = viewportX - rect.width / 2 - sourceX * nextZoom
+  const nextPanY = viewportY - rect.height / 2 - sourceY * nextZoom
+
+  setCanvasViewport(nextZoom, nextPanX, nextPanY)
+}
+
+const zoomCanvasIn = (): void => {
+  zoomCanvasAtPoint(canvasZoom.value * CANVAS_ZOOM_STEP)
+}
+
+const zoomCanvasOut = (): void => {
+  zoomCanvasAtPoint(canvasZoom.value / CANVAS_ZOOM_STEP)
+}
+
+const getCanvasSourcePoint = (clientX: number, clientY: number): { x: number; y: number; canvasSize: number } | null => {
+  const canvas = patternCanvas.value
+  if (!canvas) return null
+
+  const rect = canvas.getBoundingClientRect()
+  const zoom = Math.max(MIN_CANVAS_ZOOM, canvasZoom.value)
+  const canvasSize = Math.max(1, Math.min(rect.width, rect.height) / zoom)
+  const viewportX = clientX - rect.left
+  const viewportY = clientY - rect.top
+
+  if (viewportX < 0 || viewportY < 0 || viewportX > rect.width || viewportY > rect.height) {
+    return null
+  }
+
+  return {
+    x: viewportX / zoom,
+    y: viewportY / zoom,
+    canvasSize
   }
 }
 
@@ -408,8 +580,7 @@ const drawPatternCanvas = (): void => {
   const frame = patternCanvasFrame.value
   if (!canvas || !frame) return
 
-  const frameRect = frame.getBoundingClientRect()
-  const cssSize = Math.max(1, Math.floor(Math.min(frameRect.width, frameRect.height)))
+  const cssSize = Math.max(1, Math.floor(Math.min(frame.clientWidth, frame.clientHeight)))
   const pixelRatio = Math.max(1, window.devicePixelRatio || 1)
   const pixelSize = Math.floor(cssSize * pixelRatio)
 
@@ -543,15 +714,12 @@ const drawPatternCanvas = (): void => {
   context.strokeRect(metrics.gridX + 0.5, metrics.gridY + 0.5, metrics.gridSize - 1, metrics.gridSize - 1)
 }
 
-const getCanvasCellIndex = (event: MouseEvent): number | null => {
-  const canvas = patternCanvas.value
-  if (!canvas) return null
+const getCanvasCellIndex = (event: MouseEvent | PointerEvent): number | null => {
+  const point = getCanvasSourcePoint(event.clientX, event.clientY)
+  if (!point) return null
 
-  const rect = canvas.getBoundingClientRect()
-  const canvasSize = Math.min(rect.width, rect.height)
-  const metrics = getCanvasMetrics(canvasSize)
-  const x = event.clientX - rect.left
-  const y = event.clientY - rect.top
+  const metrics = getCanvasMetrics(point.canvasSize)
+  const { x, y } = point
 
   if (
     x < metrics.gridX ||
@@ -568,11 +736,113 @@ const getCanvasCellIndex = (event: MouseEvent): number | null => {
   return row * previewColumns.value + column
 }
 
-const onCanvasClick = (event: MouseEvent): void => {
+const onCanvasWheel = (event: WheelEvent): void => {
+  if (!event.ctrlKey) return
+
+  event.preventDefault()
+  const nextZoom = canvasZoom.value * Math.exp(-event.deltaY * 0.0012)
+  zoomCanvasAtPoint(nextZoom, event.clientX, event.clientY)
+}
+
+const onCanvasPointerDown = (event: PointerEvent): void => {
+  if (event.button !== 0) return
+
+  const isPanMode = isSpacePressed.value
+  if (patternCanvasStage.value && !patternCanvasStage.value.hasPointerCapture(event.pointerId)) {
+    patternCanvasStage.value.setPointerCapture(event.pointerId)
+  }
+  canvasPointerState.value = {
+    pointerId: event.pointerId,
+    button: event.button,
+    isPanMode,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startPanX: canvasPanX.value,
+    startPanY: canvasPanY.value
+  }
+  isCanvasDragging.value = false
+
+  if (isPanMode) {
+    event.preventDefault()
+  }
+}
+
+const onCanvasPointerMove = (event: PointerEvent): void => {
+  const pointerState = canvasPointerState.value
+  if (!pointerState || pointerState.pointerId !== event.pointerId) return
+
+  const deltaX = event.clientX - pointerState.startClientX
+  const deltaY = event.clientY - pointerState.startClientY
+
+  if (!isCanvasDragging.value && Math.hypot(deltaX, deltaY) > CANVAS_DRAG_THRESHOLD) {
+    isCanvasDragging.value = true
+  }
+
+  if (!pointerState.isPanMode || !isCanvasDragging.value) return
+
+  const metrics = getCanvasViewportMetrics()
+  const nextPan = getClampedCanvasPan(
+    pointerState.startPanX + deltaX,
+    pointerState.startPanY + deltaY,
+    canvasZoom.value,
+    metrics.stageWidth,
+    metrics.stageHeight,
+    metrics.shellWidth,
+    metrics.shellHeight
+  )
+  canvasPanX.value = nextPan.x
+  canvasPanY.value = nextPan.y
+  event.preventDefault()
+}
+
+const onCanvasPointerUp = (event: PointerEvent): void => {
+  const pointerState = canvasPointerState.value
+  if (!pointerState || pointerState.pointerId !== event.pointerId) return
+
+  const didDrag = isCanvasDragging.value
+  canvasPointerState.value = null
+  isCanvasDragging.value = false
+  if (patternCanvasStage.value?.hasPointerCapture(event.pointerId)) {
+    patternCanvasStage.value.releasePointerCapture(event.pointerId)
+  }
+
+  if (pointerState.isPanMode || didDrag) return
+
   const index = getCanvasCellIndex(event)
   if (index === null) return
 
   onCellClick(index)
+}
+
+const onCanvasPointerCancel = (event: PointerEvent): void => {
+  if (canvasPointerState.value?.pointerId !== event.pointerId) return
+
+  canvasPointerState.value = null
+  isCanvasDragging.value = false
+  if (patternCanvasStage.value?.hasPointerCapture(event.pointerId)) {
+    patternCanvasStage.value.releasePointerCapture(event.pointerId)
+  }
+}
+
+const onCanvasPointerEnter = (): void => {
+  isCanvasStageHovered.value = true
+}
+
+const onCanvasPointerLeave = (): void => {
+  if (canvasPointerState.value) return
+
+  isCanvasStageHovered.value = false
+}
+
+const isEditableEventTarget = (target: EventTarget | null): boolean => {
+  if (!(target instanceof HTMLElement)) return false
+
+  const tagName = target.tagName.toLowerCase()
+  return target.isContentEditable || tagName === 'input' || tagName === 'textarea' || tagName === 'select'
+}
+
+const isSpaceKeyEvent = (event: KeyboardEvent): boolean => {
+  return event.code === 'Space' || event.key === ' ' || event.key === 'Spacebar'
 }
 
 const syncPatternFullscreenState = (): void => {
@@ -615,10 +885,29 @@ const togglePatternFullscreen = async (): Promise<void> => {
 }
 
 const onPatternPreviewKeydown = (event: KeyboardEvent): void => {
+  if (isSpaceKeyEvent(event) && (!isEditableEventTarget(event.target) || isCanvasStageHovered.value)) {
+    isSpacePressed.value = true
+    event.preventDefault()
+    return
+  }
+
   if (event.key !== 'Escape' || !isPatternOverlayFullscreen.value) return
 
   isPatternOverlayFullscreen.value = false
   syncPatternFullscreenState()
+}
+
+const onPatternPreviewKeyup = (event: KeyboardEvent): void => {
+  if (!isSpaceKeyEvent(event)) return
+
+  isSpacePressed.value = false
+}
+
+const resetCanvasInteraction = (): void => {
+  isSpacePressed.value = false
+  isCanvasStageHovered.value = false
+  canvasPointerState.value = null
+  isCanvasDragging.value = false
 }
 
 const getDisplayFileName = (filePath: string): string => {
@@ -648,6 +937,7 @@ const buildSavedProject = (): SavedProject => {
       manufacturer: activeManufacturerPalette.value.id,
       boardSize: selectedBoardSize.value,
       maxColors: maxColors.value,
+      inputMode: inputMode.value,
       dithering: enableDithering.value,
       cleanup: enablePixelCleanup.value,
       showLabels: showGridLabels.value
@@ -671,6 +961,7 @@ const applySavedProject = (project: SavedProject, displayName: string): void => 
   isApplyingProject = true
   selectedManufacturer.value = getManufacturerPalette(project.board.manufacturer).id
   selectedBoardSize.value = project.board.boardSize
+  inputMode.value = project.board.inputMode ?? 'image'
   maxColors.value = project.board.maxColors
   enableDithering.value = project.board.dithering
   enablePixelCleanup.value = project.board.cleanup ?? true
@@ -1112,7 +1403,7 @@ const onImageSelected = async (event: Event): Promise<void> => {
   input.value = ''
 }
 
-watch([selectedManufacturer, selectedBoardSize, maxColors, enableDithering, enablePixelCleanup], () => {
+watch([selectedManufacturer, selectedBoardSize, inputMode, maxColors, enableDithering, enablePixelCleanup], () => {
   if (isApplyingProject) return
 
   const paletteColors = activePaletteColors.value
@@ -1280,35 +1571,48 @@ watch([patternGrid, showGridLabels, resolvedTheme], () => {
   void nextTick(drawPatternCanvas)
 }, { deep: true })
 
+watch(canvasBaseSize, () => {
+  void nextTick(drawPatternCanvas)
+})
+
 onMounted(() => {
   void loadProviderProfiles()
   document.addEventListener('fullscreenchange', syncPatternFullscreenState)
-  document.addEventListener('keydown', onPatternPreviewKeydown)
+  window.addEventListener('keydown', onPatternPreviewKeydown, true)
+  window.addEventListener('keyup', onPatternPreviewKeyup, true)
+  window.addEventListener('blur', resetCanvasInteraction)
   void nextTick(() => {
+    updateCanvasBaseSize()
     drawPatternCanvas()
 
-    if (patternCanvasFrame.value) {
-      canvasResizeObserver = new ResizeObserver(() => drawPatternCanvas())
-      canvasResizeObserver.observe(patternCanvasFrame.value)
+    if (patternCanvasStage.value) {
+      canvasResizeObserver = new ResizeObserver(() => {
+        updateCanvasBaseSize()
+        setCanvasViewport(canvasZoom.value)
+        void nextTick(drawPatternCanvas)
+      })
+      canvasResizeObserver.observe(patternCanvasStage.value)
     }
   })
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('fullscreenchange', syncPatternFullscreenState)
-  document.removeEventListener('keydown', onPatternPreviewKeydown)
+  window.removeEventListener('keydown', onPatternPreviewKeydown, true)
+  window.removeEventListener('keyup', onPatternPreviewKeyup, true)
+  window.removeEventListener('blur', resetCanvasInteraction)
   canvasResizeObserver?.disconnect()
   canvasResizeObserver = null
 })
 </script>
 
 <template>
-  <div class="flex h-screen bg-ink-50 text-ink-900 dark:bg-ink-900 dark:text-ink-50">
-    <aside
-      class="flex w-64 shrink-0 flex-col border-r border-ink-100 bg-white/78 px-4 py-4 dark:border-white/10 dark:bg-ink-800/80"
+  <div class="flex h-screen flex-col bg-ink-50 text-ink-900 dark:bg-ink-900 dark:text-ink-50">
+    <header
+      class="flex h-16 shrink-0 items-center justify-between border-b border-ink-100 bg-white/82 px-5 dark:border-white/10 dark:bg-ink-800/78"
     >
-      <div class="flex items-center gap-3 border-b border-ink-100 pb-4 dark:border-white/10">
-        <div class="grid h-10 w-10 grid-cols-3 gap-0.5 rounded-md bg-ink-900 p-1 dark:bg-ink-50">
+      <div class="flex min-w-0 items-center gap-3">
+        <div class="grid h-10 w-10 shrink-0 grid-cols-3 gap-0.5 rounded-md bg-ink-900 p-1 dark:bg-ink-50">
           <span class="rounded-sm bg-bead-coral"></span>
           <span class="rounded-sm bg-bead-mint"></span>
           <span class="rounded-sm bg-bead-amber"></span>
@@ -1321,36 +1625,19 @@ onBeforeUnmount(() => {
         </div>
         <div class="min-w-0">
           <h1 class="truncate text-base font-semibold">拼豆图纸工作台</h1>
-          <p class="truncate text-xs text-ink-600 dark:text-ink-300">Perler Beads Studio</p>
+          <p class="truncate text-xs text-ink-600 dark:text-ink-300">
+            {{ previewColumns }} x {{ previewRows }} · {{ activeManufacturerPalette.name }} · {{ usedColors.length }} 色
+          </p>
         </div>
       </div>
 
-      <nav class="mt-5 space-y-2">
-        <button
-          v-for="step in workflowSteps"
-          :key="step.id"
-          class="flex w-full items-center gap-3 rounded-md border px-3 py-2.5 text-left text-sm transition"
-          :class="
-            step.status === 'ready'
-              ? 'border-bead-mint/60 bg-bead-mint/12 text-ink-900 dark:text-ink-50'
-              : step.status === 'next'
-                ? 'border-bead-amber/60 bg-bead-amber/12 text-ink-900 dark:text-ink-50'
-                : 'border-transparent text-ink-600 hover:border-ink-100 hover:bg-ink-50 dark:text-ink-300 dark:hover:border-white/10 dark:hover:bg-white/5'
-          "
-          type="button"
-        >
-          <Icon :icon="step.icon" class="h-5 w-5 shrink-0" />
-          <span class="truncate">{{ step.label }}</span>
-        </button>
-      </nav>
-
-      <div class="mt-auto space-y-3 border-t border-ink-100 pt-4 dark:border-white/10">
+      <div class="flex items-center gap-2">
         <div class="grid grid-cols-3 gap-1 rounded-md bg-ink-100 p-1 dark:bg-white/10">
           <button
             v-for="option in themeOptions"
             :key="option.value"
             type="button"
-            class="flex items-center justify-center gap-1 rounded px-2 py-1.5 text-xs transition"
+            class="flex h-8 w-8 items-center justify-center rounded transition"
             :class="
               preference === option.value
                 ? 'bg-white text-ink-900 shadow-sm dark:bg-ink-700 dark:text-ink-50'
@@ -1360,90 +1647,66 @@ onBeforeUnmount(() => {
             @click="setPreference(option.value)"
           >
             <Icon :icon="option.icon" class="h-4 w-4" />
-            <span>{{ option.label }}</span>
           </button>
         </div>
 
         <button
+          class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
           type="button"
-          class="flex w-full items-center justify-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:border-ink-300 hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-          title="循环切换主题"
-          @click="cycleTheme"
+          title="打开项目"
+          @click="openProject"
         >
-          <Icon :icon="themeButtonIcon" class="h-4 w-4" />
-          <span>快速切换</span>
+          <Icon icon="ri:folder-open-line" class="h-4 w-4" />
+          <span>打开</span>
+        </button>
+        <button
+          class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+          type="button"
+          title="保存项目"
+          @click="saveProject"
+        >
+          <Icon icon="ri:save-3-line" class="h-4 w-4" />
+          <span>保存</span>
+        </button>
+        <label
+          class="inline-flex cursor-pointer items-center gap-2 rounded-md bg-ink-900 px-3 py-2 text-sm font-medium text-white transition hover:bg-ink-800 dark:bg-ink-50 dark:text-ink-900 dark:hover:bg-white"
+          title="导入图片"
+        >
+          <Icon icon="ri:image-add-line" class="h-4 w-4" />
+          <span>{{ isGenerating ? '转换中' : '导入图片' }}</span>
+          <input class="hidden" type="file" accept="image/*" @change="onImageSelected" />
+        </label>
+        <input
+          ref="projectFileInput"
+          class="hidden"
+          type="file"
+          accept=".pbd.json,.json,application/json"
+          @change="onProjectFileSelected"
+        />
+        <button
+          class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+          type="button"
+          title="打印或另存为 PDF"
+          @click="printPattern"
+        >
+          <Icon icon="ri:printer-line" class="h-4 w-4" />
+          <span>打印</span>
+        </button>
+        <button
+          class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+          type="button"
+          title="导出 PNG 图纸"
+          @click="exportPattern"
+        >
+          <Icon icon="ri:file-download-line" class="h-4 w-4" />
+          <span>导出</span>
         </button>
       </div>
-    </aside>
+    </header>
 
-    <main class="flex min-w-0 flex-1 flex-col">
-      <header
-        class="flex h-16 shrink-0 items-center justify-between border-b border-ink-100 bg-white/72 px-5 dark:border-white/10 dark:bg-ink-800/70"
-      >
-        <div class="min-w-0">
-          <h2 class="truncate text-lg font-semibold">图片转拼豆图纸</h2>
-          <p class="truncate text-xs text-ink-600 dark:text-ink-300">
-            {{ previewColumns }} x {{ previewRows }} · {{ activeManufacturerPalette.name }} · {{ usedColors.length }} 色
-          </p>
-        </div>
-
-        <div class="flex items-center gap-2">
-          <button
-            class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-            type="button"
-            title="打开项目"
-            @click="openProject"
-          >
-            <Icon icon="ri:folder-open-line" class="h-4 w-4" />
-            <span>打开</span>
-          </button>
-          <button
-            class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-            type="button"
-            title="保存项目"
-            @click="saveProject"
-          >
-            <Icon icon="ri:save-3-line" class="h-4 w-4" />
-            <span>保存</span>
-          </button>
-          <label
-            class="inline-flex cursor-pointer items-center gap-2 rounded-md bg-ink-900 px-3 py-2 text-sm font-medium text-white transition hover:bg-ink-800 dark:bg-ink-50 dark:text-ink-900 dark:hover:bg-white"
-            title="导入图片"
-          >
-            <Icon icon="ri:image-add-line" class="h-4 w-4" />
-            <span>{{ isGenerating ? '转换中' : '导入图片' }}</span>
-            <input class="hidden" type="file" accept="image/*" @change="onImageSelected" />
-          </label>
-          <input
-            ref="projectFileInput"
-            class="hidden"
-            type="file"
-            accept=".pbd.json,.json,application/json"
-            @change="onProjectFileSelected"
-          />
-          <button
-            class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-            type="button"
-            title="打印或另存为 PDF"
-            @click="printPattern"
-          >
-            <Icon icon="ri:printer-line" class="h-4 w-4" />
-            <span>打印</span>
-          </button>
-          <button
-            class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-            type="button"
-            title="导出 PNG 图纸"
-            @click="exportPattern"
-          >
-            <Icon icon="ri:file-download-line" class="h-4 w-4" />
-            <span>导出</span>
-          </button>
-        </div>
-      </header>
-
+    <main class="flex min-h-0 flex-1 flex-col">
       <div
-        class="grid min-h-0 flex-1 grid-cols-[minmax(240px,280px)_minmax(340px,1fr)_minmax(280px,320px)] gap-4 p-4"
+        class="grid min-h-0 flex-1 grid-cols-[minmax(250px,300px)_minmax(300px,1fr)_minmax(280px,340px)] gap-4 p-4"
       >
         <section
           class="tool-scroll min-h-0 overflow-auto rounded-md border border-ink-100 bg-white p-4 shadow-panel dark:border-white/10 dark:bg-ink-800"
@@ -1477,6 +1740,18 @@ onBeforeUnmount(() => {
                 class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-mint dark:border-white/10 dark:bg-ink-900"
               >
                 <option v-for="size in boardSizes" :key="size">{{ size }}</option>
+              </select>
+            </label>
+
+            <label class="block space-y-1.5">
+              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">输入类型</span>
+              <select
+                v-model="inputMode"
+                class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-mint dark:border-white/10 dark:bg-ink-900"
+              >
+                <option v-for="mode in inputModes" :key="mode.id" :value="mode.id">
+                  {{ mode.label }}
+                </option>
               </select>
             </label>
 
@@ -1528,42 +1803,12 @@ onBeforeUnmount(() => {
               <span class="mt-1 block text-ink-500 dark:text-ink-400">
                 {{ projectStatus }}
               </span>
-            </div>
-          </div>
-
-          <div class="mt-6 border-t border-ink-100 pt-4 dark:border-white/10">
-            <div class="mb-3 flex items-center justify-between gap-2">
-              <div class="flex items-center gap-2">
-                <Icon icon="ri:palette-line" class="h-5 w-5 text-bead-violet" />
-                <h3 class="text-sm font-semibold">当前用色</h3>
-              </div>
               <span
-                class="h-5 w-5 rounded-full border border-ink-200 dark:border-white/10"
-                :style="{ backgroundColor: selectedColorHex }"
-                :title="selectedColor.name"
-              ></span>
-            </div>
-            <div class="grid grid-cols-3 gap-2">
-              <button
-                v-for="color in displayedColors"
-                :key="color.id"
-                type="button"
-                class="rounded-md border p-2 text-left text-[11px] transition hover:border-ink-300 dark:border-white/10"
-                :class="
-                  selectedColorHex === color.hex
-                    ? 'border-bead-coral bg-bead-coral/10'
-                    : 'border-ink-100'
-                "
-                :title="`${color.id} ${color.name}`"
-                @click="selectedColorHex = color.hex"
+                v-if="inputMode === 'pixel-art'"
+                class="mt-2 block text-bead-sky"
               >
-                <span class="mb-2 block h-7 rounded" :style="{ backgroundColor: color.hex }"></span>
-                <span class="block truncate font-semibold">{{ color.id }}</span>
-                <span class="block truncate text-ink-500 dark:text-ink-400">{{ color.name }}</span>
-                <span class="block truncate text-ink-500 dark:text-ink-400">
-                  {{ color.count }}
-                </span>
-              </button>
+                像素画模式：按格采样并匹配色卡
+              </span>
             </div>
           </div>
 
@@ -1623,6 +1868,32 @@ onBeforeUnmount(() => {
               <button
                 class="rounded-md p-2 text-ink-600 transition hover:bg-ink-100 disabled:opacity-40 dark:text-ink-300 dark:hover:bg-white/10"
                 type="button"
+                title="缩小"
+                :disabled="canvasZoom <= 0.5"
+                @click="zoomCanvasOut"
+              >
+                <Icon icon="ri:zoom-out-line" class="h-4 w-4" />
+              </button>
+              <button
+                class="min-w-14 rounded-md px-2 py-1.5 text-xs font-semibold text-ink-600 transition hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10"
+                type="button"
+                title="重置缩放和位置"
+                @click="resetCanvasViewport"
+              >
+                {{ canvasZoomPercent }}%
+              </button>
+              <button
+                class="rounded-md p-2 text-ink-600 transition hover:bg-ink-100 disabled:opacity-40 dark:text-ink-300 dark:hover:bg-white/10"
+                type="button"
+                title="放大"
+                :disabled="canvasZoom >= 8"
+                @click="zoomCanvasIn"
+              >
+                <Icon icon="ri:zoom-in-line" class="h-4 w-4" />
+              </button>
+              <button
+                class="rounded-md p-2 text-ink-600 transition hover:bg-ink-100 disabled:opacity-40 dark:text-ink-300 dark:hover:bg-white/10"
+                type="button"
                 title="撤销"
                 :disabled="undoStack.length === 0"
                 @click="undo"
@@ -1664,19 +1935,66 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <div class="flex min-h-0 flex-1 items-center justify-center bg-ink-50 p-5 dark:bg-ink-900">
+          <div
+            ref="patternCanvasStage"
+            class="pattern-canvas-stage flex min-h-0 flex-1 touch-none select-none items-center justify-center overflow-hidden bg-ink-50 p-5 dark:bg-ink-900"
+            :class="canvasCursorClass"
+            @wheel="onCanvasWheel"
+            @pointerdown="onCanvasPointerDown"
+            @pointermove="onCanvasPointerMove"
+            @pointerup="onCanvasPointerUp"
+            @pointercancel="onCanvasPointerCancel"
+            @pointerenter="onCanvasPointerEnter"
+            @pointerleave="onCanvasPointerLeave"
+          >
             <div
-              class="pattern-canvas-shell aspect-square w-full max-w-[620px] rounded-md border border-ink-200 bg-white p-3 shadow-panel dark:border-white/10 dark:bg-ink-800"
+              ref="patternCanvasShell"
+              class="pattern-canvas-shell origin-center rounded-md border border-ink-200 bg-white p-3 shadow-panel will-change-transform dark:border-white/10 dark:bg-ink-800"
+              :style="canvasShellStyle"
             >
               <div ref="patternCanvasFrame" class="flex h-full w-full items-center justify-center">
                 <canvas
                   ref="patternCanvas"
-                  class="h-full max-h-full max-w-full cursor-crosshair rounded-md outline-none focus:ring-2 focus:ring-bead-coral"
+                  class="h-full max-h-full max-w-full touch-none select-none rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ink-400/40 dark:focus-visible:ring-white/35"
                   role="img"
                   tabindex="0"
                   :aria-label="`拼豆图纸预览，${previewColumns} x ${previewRows}`"
-                  @click="onCanvasClick"
                 ></canvas>
+              </div>
+            </div>
+          </div>
+
+          <div class="border-t border-ink-100 px-4 py-3 dark:border-white/10">
+            <div class="flex min-w-0 items-center gap-3">
+              <div class="flex shrink-0 items-center gap-2">
+                <Icon icon="ri:palette-line" class="h-4 w-4 text-bead-violet" />
+                <span class="text-xs font-semibold text-ink-600 dark:text-ink-300">当前用色</span>
+                <span
+                  class="h-4 w-4 rounded-full border border-ink-200 dark:border-white/10"
+                  :style="{ backgroundColor: selectedColorHex }"
+                  :title="selectedColor.name"
+                ></span>
+              </div>
+              <div class="tool-scroll flex min-w-0 flex-1 gap-2 overflow-x-auto pb-1">
+                <button
+                  v-for="color in displayedColors"
+                  :key="color.id"
+                  type="button"
+                  class="grid h-14 min-w-24 grid-cols-[2rem_minmax(0,1fr)] items-center gap-2 rounded-md border px-2 text-left text-[11px] transition hover:border-ink-300 dark:border-white/10"
+                  :class="
+                    selectedColorHex === color.hex
+                      ? 'border-bead-coral bg-bead-coral/10'
+                      : 'border-ink-100'
+                  "
+                  :title="`${color.id} ${color.name}`"
+                  @click="selectedColorHex = color.hex"
+                >
+                  <span class="h-8 w-8 rounded border border-ink-100 dark:border-white/10" :style="{ backgroundColor: color.hex }"></span>
+                  <span class="min-w-0">
+                    <span class="block truncate font-semibold">{{ color.id }}</span>
+                    <span class="block truncate text-ink-500 dark:text-ink-400">{{ color.count }}</span>
+                  </span>
+                </button>
               </div>
             </div>
           </div>
@@ -1690,7 +2008,7 @@ onBeforeUnmount(() => {
             </div>
             <div>
               <span class="block text-xs text-ink-500 dark:text-ink-400">颜色</span>
-              <strong>{{ usedColors.length }}</strong>
+              <strong>{{ actualUsedColorCount }}</strong>
             </div>
             <div>
               <span class="block text-xs text-ink-500 dark:text-ink-400">工具</span>
@@ -1706,7 +2024,7 @@ onBeforeUnmount(() => {
             </div>
             <div>
               <span class="block text-xs text-ink-500 dark:text-ink-400">清理</span>
-              <strong>{{ enablePixelCleanup ? '开启' : '关闭' }}</strong>
+              <strong>{{ inputMode === 'pixel-art' ? '不参与' : enablePixelCleanup ? '开启' : '关闭' }}</strong>
             </div>
           </div>
         </section>
