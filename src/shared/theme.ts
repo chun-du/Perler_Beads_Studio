@@ -2,7 +2,11 @@ import type {
   AiImageOptimizationRequest,
   AiImageOptimizationResult,
   AiListModelsResult,
-  AiProviderConnection
+  AiProviderConnection,
+  AiProviderProfileDeleteResult,
+  AiProviderProfileListResult,
+  AiProviderProfileSaveRequest,
+  AiProviderProfileSaveResult
 } from './ai'
 import type { ProjectOpenResult, ProjectSaveRequest, ProjectSaveResult } from './project'
 
@@ -17,6 +21,9 @@ export interface ThemeBridge {
 export interface AiBridge {
   listModels: (connection: AiProviderConnection) => Promise<AiListModelsResult>
   optimizeImage: (request: AiImageOptimizationRequest) => Promise<AiImageOptimizationResult>
+  listProviderProfiles: () => Promise<AiProviderProfileListResult>
+  saveProviderProfile: (request: AiProviderProfileSaveRequest) => Promise<AiProviderProfileSaveResult>
+  deleteProviderProfile: (profileId: string) => Promise<AiProviderProfileDeleteResult>
 }
 
 export interface ProjectBridge {

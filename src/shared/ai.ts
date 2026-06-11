@@ -1,6 +1,7 @@
 export interface AiProviderConnection {
   baseUrl: string
   apiKey: string
+  providerProfileId?: string
 }
 
 export interface AiImageOptimizationRequest extends AiProviderConnection {
@@ -26,6 +27,53 @@ export interface AiImageOptimizationResult {
   ok: boolean
   imageDataUrl?: string
   revisedPrompt?: string
+  error?: string
+}
+
+export type AiModelCapability = 'image-generation' | 'image-editing' | 'vision' | 'text'
+
+export interface AiProviderProfile {
+  id: string
+  name: string
+  baseUrl: string
+  models: string[]
+  selectedModel: string
+  capabilitiesByModel: Record<string, AiModelCapability[]>
+  hasApiKey: boolean
+  updatedAt: string
+}
+
+export interface AiProviderProfileInput {
+  id?: string
+  name: string
+  baseUrl: string
+  models: string[]
+  selectedModel: string
+  capabilitiesByModel: Record<string, AiModelCapability[]>
+}
+
+export interface AiProviderProfileSaveRequest {
+  profile: AiProviderProfileInput
+  apiKey?: string
+}
+
+export interface AiProviderProfileListResult {
+  ok: boolean
+  profiles: AiProviderProfile[]
+  secureStorageAvailable: boolean
+  error?: string
+}
+
+export interface AiProviderProfileSaveResult {
+  ok: boolean
+  profile?: AiProviderProfile
+  secureStorageAvailable: boolean
+  error?: string
+}
+
+export interface AiProviderProfileDeleteResult {
+  ok: boolean
+  secureStorageAvailable: boolean
   error?: string
 }
 

@@ -7,6 +7,7 @@ export interface SavedProject {
     boardSize: string
     maxColors: number
     dithering: boolean
+    cleanup: boolean
     showLabels: boolean
   }
   pattern: {

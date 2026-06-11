@@ -27,12 +27,6 @@ select {
   font: inherit;
 }
 
-.bead-cell {
-  box-shadow:
-    inset 0 0 0 1px rgb(0 0 0 / 0.16),
-    inset 0 2px 3px rgb(255 255 255 / 0.24);
-}
-
 .tool-scroll {
   scrollbar-width: thin;
   scrollbar-color: rgb(184 173 157 / 0.65) transparent;
@@ -47,4 +41,23 @@ select {
   border: 3px solid transparent;
   border-radius: 999px;
   background-clip: content-box;
+}
+
+.pattern-preview-panel:fullscreen,
+.pattern-preview-panel.is-overlay-fullscreen {
+  width: 100vw;
+  height: 100vh;
+  border: 0;
+  border-radius: 0;
+}
+
+.pattern-preview-panel.is-overlay-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+}
+
+.pattern-preview-panel:fullscreen .pattern-canvas-shell,
+.pattern-preview-panel.is-overlay-fullscreen .pattern-canvas-shell {
+  max-width: min(92vw, 82vh);
 }

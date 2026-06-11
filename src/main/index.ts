@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, safeStorage, shell } from 'electron'
 import { Buffer } from 'node:buffer'
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -6,7 +6,14 @@ import type {
   AiImageOptimizationRequest,
   AiImageOptimizationResult,
   AiListModelsResult,
-  AiProviderConnection
+  AiModelCapability,
+  AiProviderConnection,
+  AiProviderProfile,
+  AiProviderProfileDeleteResult,
+  AiProviderProfileInput,
+  AiProviderProfileListResult,
+  AiProviderProfileSaveRequest,
+  AiProviderProfileSaveResult
 } from '../shared/ai'
 import { buildAiImageEditsUrl, buildAiModelsUrl, createAiImageOptimizationPrompt } from '../shared/ai'
 import type { ProjectOpenResult, ProjectSaveRequest, ProjectSaveResult, SavedProject } from '../shared/project'
@@ -14,6 +21,18 @@ import type { ThemePreference } from '../shared/theme'
 import type { OpenDialogOptions, SaveDialogOptions } from 'electron'
 
 let mainWindow: BrowserWindow | null = null
+
+interface StoredAiProviderProfile extends Omit<AiProviderProfile, 'hasApiKey'> {
+  encryptedApiKey?: string
+}
+
+interface StoredAiProviderProfilesFile {
+  schemaVersion: 1
+  profiles: StoredAiProviderProfile[]
+}
+
+const aiProviderProfilesFileName = 'ai-provider-profiles.json'
+const aiModelCapabilities = ['image-generation', 'image-editing', 'vision', 'text'] satisfies AiModelCapability[]
 
 const isValidThemePreference = (value: unknown): value is ThemePreference => {
   return value === 'light' || value === 'dark' || value === 'system'
@@ -102,6 +121,123 @@ const isAiImageOptimizationRequest = (value: unknown): value is AiImageOptimizat
   )
 }
 
+const getAiProviderProfilesPath = (): string => {
+  return join(app.getPath('userData'), aiProviderProfilesFileName)
+}
+
+const createProfileId = (): string => {
+  return `provider-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+const isValidAiModelCapability = (value: unknown): value is AiModelCapability => {
+  return typeof value === 'string' && aiModelCapabilities.includes(value as AiModelCapability)
+}
+
+const normalizeModelList = (models: string[], selectedModel: string): string[] => {
+  const uniqueModels = [...new Set(models.map((model) => model.trim()).filter(Boolean))]
+  const normalizedSelectedModel = selectedModel.trim()
+
+  if (normalizedSelectedModel && !uniqueModels.includes(normalizedSelectedModel)) {
+    uniqueModels.unshift(normalizedSelectedModel)
+  }
+
+  return uniqueModels
+}
+
+const isAiProviderProfileInput = (value: unknown): value is AiProviderProfileInput => {
+  if (!isRecord(value)) return false
+  if (value.id !== undefined && typeof value.id !== 'string') return false
+  if (typeof value.name !== 'string' || typeof value.baseUrl !== 'string') return false
+  if (typeof value.selectedModel !== 'string' || !Array.isArray(value.models)) return false
+  if (!value.models.every((model) => typeof model === 'string')) return false
+  if (!isRecord(value.capabilitiesByModel)) return false
+
+  return Object.entries(value.capabilitiesByModel).every(([model, capabilities]) => {
+    return typeof model === 'string' && Array.isArray(capabilities) && capabilities.every(isValidAiModelCapability)
+  })
+}
+
+const toPublicAiProviderProfile = (profile: StoredAiProviderProfile): AiProviderProfile => {
+  return {
+    id: profile.id,
+    name: profile.name,
+    baseUrl: profile.baseUrl,
+    models: profile.models,
+    selectedModel: profile.selectedModel,
+    capabilitiesByModel: profile.capabilitiesByModel,
+    hasApiKey: Boolean(profile.encryptedApiKey),
+    updatedAt: profile.updatedAt
+  }
+}
+
+const readStoredAiProviderProfiles = async (): Promise<StoredAiProviderProfile[]> => {
+  try {
+    const content = await readFile(getAiProviderProfilesPath(), 'utf8')
+    const payload = JSON.parse(content) as unknown
+
+    if (!isRecord(payload) || payload.schemaVersion !== 1 || !Array.isArray(payload.profiles)) {
+      return []
+    }
+
+    return payload.profiles.filter((profile): profile is StoredAiProviderProfile => {
+      if (!isRecord(profile)) return false
+      if (typeof profile.id !== 'string' || typeof profile.name !== 'string' || typeof profile.baseUrl !== 'string') {
+        return false
+      }
+      if (!Array.isArray(profile.models) || !profile.models.every((model) => typeof model === 'string')) return false
+      if (typeof profile.selectedModel !== 'string' || typeof profile.updatedAt !== 'string') return false
+      if (!isRecord(profile.capabilitiesByModel)) return false
+      if (profile.encryptedApiKey !== undefined && typeof profile.encryptedApiKey !== 'string') return false
+
+      return Object.values(profile.capabilitiesByModel).every((capabilities) => {
+        return Array.isArray(capabilities) && capabilities.every(isValidAiModelCapability)
+      })
+    })
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return []
+    }
+
+    throw error
+  }
+}
+
+const writeStoredAiProviderProfiles = async (profiles: StoredAiProviderProfile[]): Promise<void> => {
+  const payload: StoredAiProviderProfilesFile = {
+    schemaVersion: 1,
+    profiles
+  }
+
+  await writeFile(getAiProviderProfilesPath(), `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+}
+
+const encryptApiKey = (apiKey: string): string => {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('当前系统不可用安全存储，未保存 API Key')
+  }
+
+  return safeStorage.encryptString(apiKey).toString('base64')
+}
+
+const decryptApiKey = (encryptedApiKey: string): string => {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('当前系统不可用安全存储，无法读取 API Key')
+  }
+
+  return safeStorage.decryptString(Buffer.from(encryptedApiKey, 'base64'))
+}
+
+const getStoredApiKey = async (profileId: string | undefined): Promise<string> => {
+  if (!profileId) return ''
+
+  const profiles = await readStoredAiProviderProfiles()
+  const profile = profiles.find((item) => item.id === profileId)
+
+  if (!profile?.encryptedApiKey) return ''
+
+  return decryptApiKey(profile.encryptedApiKey)
+}
+
 const parseImageDataUrl = (dataUrl: string): { mimeType: string; buffer: Buffer } | null => {
   const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s.exec(dataUrl)
 
@@ -167,6 +303,152 @@ const readRemoteImageAsDataUrl = async (url: string): Promise<string> => {
 }
 
 const registerAiIpc = (): void => {
+  ipcMain.handle('ai:list-provider-profiles', async (): Promise<AiProviderProfileListResult> => {
+    try {
+      const profiles = await readStoredAiProviderProfiles()
+
+      return {
+        ok: true,
+        profiles: profiles.map(toPublicAiProviderProfile),
+        secureStorageAvailable: safeStorage.isEncryptionAvailable()
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '供应商配置读取失败'
+      return {
+        ok: false,
+        profiles: [],
+        secureStorageAvailable: safeStorage.isEncryptionAvailable(),
+        error: message
+      }
+    }
+  })
+
+  ipcMain.handle(
+    'ai:save-provider-profile',
+    async (_event, request: AiProviderProfileSaveRequest): Promise<AiProviderProfileSaveResult> => {
+      if (!isRecord(request) || !isAiProviderProfileInput(request.profile)) {
+        return {
+          ok: false,
+          secureStorageAvailable: safeStorage.isEncryptionAvailable(),
+          error: '供应商配置格式不正确'
+        }
+      }
+
+      const profileInput = request.profile
+      const name = profileInput.name.trim()
+      const baseUrl = profileInput.baseUrl.trim()
+      const selectedModel = profileInput.selectedModel.trim()
+
+      if (!name) {
+        return {
+          ok: false,
+          secureStorageAvailable: safeStorage.isEncryptionAvailable(),
+          error: '供应商名称不能为空'
+        }
+      }
+
+      if (!baseUrl) {
+        return {
+          ok: false,
+          secureStorageAvailable: safeStorage.isEncryptionAvailable(),
+          error: 'Base URL 不能为空'
+        }
+      }
+
+      try {
+        new URL(baseUrl)
+      } catch {
+        return {
+          ok: false,
+          secureStorageAvailable: safeStorage.isEncryptionAvailable(),
+          error: 'Base URL 格式不正确'
+        }
+      }
+
+      if (!selectedModel) {
+        return {
+          ok: false,
+          secureStorageAvailable: safeStorage.isEncryptionAvailable(),
+          error: '模型不能为空'
+        }
+      }
+
+      try {
+        const profiles = await readStoredAiProviderProfiles()
+        const profileId = profileInput.id?.trim() || createProfileId()
+        const existingProfile = profiles.find((profile) => profile.id === profileId)
+        const models = normalizeModelList(profileInput.models, selectedModel)
+        const modelSet = new Set(models)
+        const capabilitiesByModel = Object.fromEntries(
+          Object.entries(profileInput.capabilitiesByModel)
+            .filter(([model]) => modelSet.has(model))
+            .map(([model, capabilities]) => [model, [...new Set(capabilities)]])
+        )
+        let encryptedApiKey = existingProfile?.encryptedApiKey
+
+        if (typeof request.apiKey === 'string' && request.apiKey.trim()) {
+          encryptedApiKey = encryptApiKey(request.apiKey.trim())
+        }
+
+        const nextProfile: StoredAiProviderProfile = {
+          id: profileId,
+          name,
+          baseUrl,
+          models,
+          selectedModel,
+          capabilitiesByModel,
+          encryptedApiKey,
+          updatedAt: new Date().toISOString()
+        }
+        const nextProfiles = existingProfile
+          ? profiles.map((profile) => (profile.id === profileId ? nextProfile : profile))
+          : [...profiles, nextProfile]
+
+        await writeStoredAiProviderProfiles(nextProfiles)
+
+        return {
+          ok: true,
+          profile: toPublicAiProviderProfile(nextProfile),
+          secureStorageAvailable: safeStorage.isEncryptionAvailable()
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '供应商配置保存失败'
+        return {
+          ok: false,
+          secureStorageAvailable: safeStorage.isEncryptionAvailable(),
+          error: message
+        }
+      }
+    }
+  )
+
+  ipcMain.handle('ai:delete-provider-profile', async (_event, profileId: unknown): Promise<AiProviderProfileDeleteResult> => {
+    if (typeof profileId !== 'string' || !profileId.trim()) {
+      return {
+        ok: false,
+        secureStorageAvailable: safeStorage.isEncryptionAvailable(),
+        error: '供应商配置 ID 不正确'
+      }
+    }
+
+    try {
+      const profiles = await readStoredAiProviderProfiles()
+      await writeStoredAiProviderProfiles(profiles.filter((profile) => profile.id !== profileId))
+
+      return {
+        ok: true,
+        secureStorageAvailable: safeStorage.isEncryptionAvailable()
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '供应商配置删除失败'
+      return {
+        ok: false,
+        secureStorageAvailable: safeStorage.isEncryptionAvailable(),
+        error: message
+      }
+    }
+  })
+
   ipcMain.handle(
     'ai:list-models',
     async (_event, connection: AiProviderConnection): Promise<AiListModelsResult> => {
@@ -174,14 +456,23 @@ const registerAiIpc = (): void => {
         return { ok: false, models: [], error: 'Base URL 不能为空' }
       }
 
-      if (!connection?.apiKey?.trim()) {
+      let apiKey = ''
+
+      try {
+        apiKey = connection.apiKey?.trim() || (await getStoredApiKey(connection.providerProfileId))
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'API Key 读取失败'
+        return { ok: false, models: [], error: message }
+      }
+
+      if (!apiKey) {
         return { ok: false, models: [], error: 'API Key 不能为空' }
       }
 
       try {
         const response = await fetch(buildAiModelsUrl(connection.baseUrl), {
           headers: {
-            Authorization: `Bearer ${connection.apiKey}`,
+            Authorization: `Bearer ${apiKey}`,
             Accept: 'application/json'
           }
         })
@@ -226,7 +517,16 @@ const registerAiIpc = (): void => {
         return { ok: false, error: 'Base URL 不能为空' }
       }
 
-      if (!request.apiKey.trim()) {
+      let apiKey = ''
+
+      try {
+        apiKey = request.apiKey.trim() || (await getStoredApiKey(request.providerProfileId))
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'API Key 读取失败'
+        return { ok: false, error: message }
+      }
+
+      if (!apiKey) {
         return { ok: false, error: 'API Key 不能为空' }
       }
 
@@ -251,7 +551,7 @@ const registerAiIpc = (): void => {
         const response = await fetch(buildAiImageEditsUrl(request.baseUrl), {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${request.apiKey}`,
+            Authorization: `Bearer ${apiKey}`,
             Accept: 'application/json'
           },
           body

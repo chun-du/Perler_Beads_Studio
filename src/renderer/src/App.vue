@@ -1,7 +1,13 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
-import type { AiImageOptimizationRequest, AiImageOptimizationResult, AiListModelsResult } from '@shared/ai'
+import type {
+  AiImageOptimizationRequest,
+  AiImageOptimizationResult,
+  AiListModelsResult,
+  AiModelCapability,
+  AiProviderProfile
+} from '@shared/ai'
 import { buildAiImageEditsUrl, buildAiModelsUrl, createAiImageOptimizationPrompt } from '@shared/ai'
 import type { SavedProject } from '@shared/project'
 import type { ThemePreference } from '@shared/theme'
@@ -22,11 +28,23 @@ import {
   exportPatternAsPng,
   isEmptyCell,
   parseBoardSize,
+  printPatternSheet,
   readImageFileAsDataUrl
 } from './utils/pattern'
 import type { PatternGrid } from './utils/pattern'
 
 type EditorTool = 'pencil' | 'fill' | 'eyedropper' | 'eraser'
+
+interface AiProviderOption {
+  id: string
+  name: string
+  baseUrl: string
+  models: string[]
+  selectedModel: string
+  capabilitiesByModel: Record<string, AiModelCapability[]>
+  hasApiKey: boolean
+  isSavedProfile: boolean
+}
 
 const { preference, resolvedTheme, setPreference, cycleTheme } = useTheme()
 
@@ -35,7 +53,7 @@ const optimizationModes = ['主体增强', '去背景', '像素画参考', '低�
 const editorTools: Array<{ id: EditorTool; icon: string; label: string }> = [
   { id: 'pencil', icon: 'ri:paint-brush-line', label: '画笔' },
   { id: 'fill', icon: 'ri:paint-fill', label: '填充' },
-  { id: 'eyedropper', icon: 'ri:contrast-dropper-line', label: '吸管' },
+  { id: 'eyedropper', icon: 'ri:dropper-line', label: '吸管' },
   { id: 'eraser', icon: 'ri:eraser-line', label: '橡皮' }
 ]
 
@@ -43,6 +61,7 @@ const selectedManufacturer = ref(defaultManufacturerId)
 const selectedBoardSize = ref(boardSizes[1])
 const maxColors = ref(24)
 const enableDithering = ref(true)
+const enablePixelCleanup = ref(true)
 const showGridLabels = ref(true)
 const activeManufacturerPalette = computed(() => getManufacturerPalette(selectedManufacturer.value))
 const activePaletteColors = computed(() => activeManufacturerPalette.value.colors)
@@ -66,23 +85,74 @@ const activeTool = ref<EditorTool>('pencil')
 const undoStack = ref<string[][]>([])
 const redoStack = ref<string[][]>([])
 const projectFileInput = ref<HTMLInputElement | null>(null)
+const patternPreviewPanel = ref<HTMLElement | null>(null)
+const patternCanvas = ref<HTMLCanvasElement | null>(null)
+const patternCanvasFrame = ref<HTMLDivElement | null>(null)
 const projectStatus = ref('尚未保存')
+const isPatternFullscreen = ref(false)
+const isPatternOverlayFullscreen = ref(false)
 let generationToken = 0
 let isApplyingProject = false
+let canvasResizeObserver: ResizeObserver | null = null
 
 const selectedProviderId = ref(aiProviderPresets[0].id)
+const savedProviderProfiles = ref<AiProviderProfile[]>([])
+const providerName = ref(aiProviderPresets[0].name)
 const baseUrl = ref(aiProviderPresets[0].baseUrl)
 const apiKey = ref('')
 const modelOptions = ref<string[]>([...aiProviderPresets[0].models])
 const selectedModel = ref(aiProviderPresets[0].models[0])
+const capabilitiesByModel = ref<Record<string, AiModelCapability[]>>({})
 const selectedMode = ref(optimizationModes[0])
 const isFetchingModels = ref(false)
+const isSavingProvider = ref(false)
+const isDeletingProvider = ref(false)
 const modelStatus = ref('使用内置模型列表')
 const modelError = ref('')
+const providerStatus = ref('')
+const providerError = ref('')
+const secureStorageAvailable = ref(false)
+
+const capabilityOptions: Array<{ id: AiModelCapability; icon: string; label: string }> = [
+  { id: 'image-editing', icon: 'ri:image-edit-line', label: '图片编辑' },
+  { id: 'image-generation', icon: 'ri:image-add-line', label: '图片生成' },
+  { id: 'vision', icon: 'ri:eye-line', label: '视觉理解' },
+  { id: 'text', icon: 'ri:text', label: '文本' }
+]
+
+const aiProviderOptions = computed<AiProviderOption[]>(() => {
+  const presetOptions = aiProviderPresets.map((provider) => ({
+    id: provider.id,
+    name: provider.name,
+    baseUrl: provider.baseUrl,
+    models: provider.models,
+    selectedModel: provider.models[0] ?? '',
+    capabilitiesByModel: {},
+    hasApiKey: false,
+    isSavedProfile: false
+  }))
+  const profileOptions = savedProviderProfiles.value.map((profile) => ({
+    id: profile.id,
+    name: profile.name,
+    baseUrl: profile.baseUrl,
+    models: profile.models,
+    selectedModel: profile.selectedModel,
+    capabilitiesByModel: profile.capabilitiesByModel,
+    hasApiKey: profile.hasApiKey,
+    isSavedProfile: true
+  }))
+
+  return [...profileOptions, ...presetOptions]
+})
 
 const selectedProvider = computed(() => {
-  return aiProviderPresets.find((provider) => provider.id === selectedProviderId.value) ?? aiProviderPresets[0]
+  return aiProviderOptions.value.find((provider) => provider.id === selectedProviderId.value) ?? aiProviderOptions.value[0]
 })
+
+const selectedModelCapabilities = computed(() => capabilitiesByModel.value[selectedModel.value] ?? [])
+const selectedProviderHasStoredKey = computed(() => selectedProvider.value?.isSavedProfile === true && selectedProvider.value.hasApiKey)
+const isDesktopAiRuntime = computed(() => window.perler?.ai !== undefined)
+const canUseStoredApiKey = computed(() => window.perler?.ai !== undefined && selectedProviderHasStoredKey.value)
 
 const previewColumns = computed(() => patternGrid.value.columns)
 const previewRows = computed(() => patternGrid.value.rows)
@@ -90,18 +160,6 @@ const beadCells = computed(() => patternGrid.value.cells)
 const shouldShowGridLabel = (value: number, maxValue: number): boolean => {
   return value === 1 || value === maxValue || value % 5 === 0
 }
-const columnLabels = computed(() =>
-  Array.from({ length: previewColumns.value }, (_item, index) => {
-    const value = index + 1
-    return shouldShowGridLabel(value, previewColumns.value) ? String(value) : ''
-  })
-)
-const rowLabels = computed(() =>
-  Array.from({ length: previewRows.value }, (_item, index) => {
-    const value = index + 1
-    return shouldShowGridLabel(value, previewRows.value) ? String(value) : ''
-  })
-)
 const patternStatus = computed(() => {
   if (isGenerating.value) return '生成中'
   if (generationError.value) return '需处理'
@@ -118,17 +176,6 @@ const selectedColor = computed(() => {
   return activePaletteColors.value.find((color) => color.hex === selectedColorHex.value) ?? activePaletteColors.value[0]
 })
 
-const getCellBackgroundColor = (color: string): string => {
-  return isEmptyCell(color) ? '#ffffff' : color
-}
-
-const getCellTitle = (color: string, index: number): string => {
-  const x = (index % previewColumns.value) + 1
-  const y = Math.floor(index / previewColumns.value) + 1
-
-  return isEmptyCell(color) ? `${x}, ${y} · 空格` : `${x}, ${y}`
-}
-
 const themeOptions: Array<{ value: ThemePreference; icon: string; label: string }> = [
   { value: 'system', icon: 'ri:computer-line', label: '系统' },
   { value: 'light', icon: 'ri:sun-line', label: '昼' },
@@ -140,20 +187,439 @@ const themeButtonIcon = computed(() => {
   return resolvedTheme.value === 'dark' ? 'ri:moon-line' : 'ri:sun-line'
 })
 
+const syncModelSelection = (): void => {
+  if (!modelOptions.value.includes(selectedModel.value)) {
+    selectedModel.value = modelOptions.value[0] ?? ''
+  }
+}
+
 const onProviderChange = (): void => {
-  baseUrl.value = selectedProvider.value.baseUrl
-  modelOptions.value = [...selectedProvider.value.models]
-  selectedModel.value = modelOptions.value[0] ?? ''
-  modelStatus.value = '使用内置模型列表'
+  const provider = selectedProvider.value
+
+  providerName.value = provider.name
+  baseUrl.value = provider.baseUrl
+  modelOptions.value = [...provider.models]
+  selectedModel.value = provider.selectedModel || modelOptions.value[0] || ''
+  capabilitiesByModel.value = { ...provider.capabilitiesByModel }
+  apiKey.value = ''
+  modelStatus.value = provider.isSavedProfile ? '已载入供应商档案' : '使用内置模型列表'
   modelError.value = ''
+  providerStatus.value = provider.hasApiKey ? '已保存 API Key，可留空使用' : ''
+  providerError.value = ''
+  syncModelSelection()
+}
+
+const loadProviderProfiles = async (): Promise<void> => {
+  if (!window.perler?.ai) {
+    secureStorageAvailable.value = false
+    providerStatus.value = 'Web 预览不保存供应商档案'
+    return
+  }
+
+  try {
+    const result = await window.perler.ai.listProviderProfiles()
+    secureStorageAvailable.value = result.secureStorageAvailable
+
+    if (!result.ok) {
+      providerError.value = result.error ?? '供应商档案读取失败'
+      return
+    }
+
+    savedProviderProfiles.value = result.profiles
+    const selected = aiProviderOptions.value.find((provider) => provider.id === selectedProviderId.value)
+
+    if (selected?.isSavedProfile) {
+      onProviderChange()
+    }
+  } catch (error) {
+    providerError.value = error instanceof Error ? error.message : '供应商档案读取失败'
+  }
+}
+
+const saveProviderProfile = async (): Promise<void> => {
+  providerError.value = ''
+  providerStatus.value = ''
+
+  if (!window.perler?.ai) {
+    providerError.value = 'Web 预览不保存供应商档案，请在桌面端保存'
+    return
+  }
+
+  if (!providerName.value.trim()) {
+    providerError.value = '请先填写供应商名称'
+    return
+  }
+
+  if (!baseUrl.value.trim()) {
+    providerError.value = '请先填写 Base URL'
+    return
+  }
+
+  if (!selectedModel.value.trim()) {
+    providerError.value = '请先选择模型'
+    return
+  }
+
+  isSavingProvider.value = true
+
+  try {
+    const providerId = selectedProvider.value?.isSavedProfile ? selectedProviderId.value : undefined
+    const result = await window.perler.ai.saveProviderProfile({
+      profile: {
+        id: providerId,
+        name: providerName.value,
+        baseUrl: baseUrl.value,
+        models: modelOptions.value,
+        selectedModel: selectedModel.value,
+        capabilitiesByModel: capabilitiesByModel.value
+      },
+      apiKey: apiKey.value || undefined
+    })
+    secureStorageAvailable.value = result.secureStorageAvailable
+
+    if (!result.ok || !result.profile) {
+      providerError.value = result.error ?? '供应商档案保存失败'
+      return
+    }
+
+    const profile = result.profile
+    savedProviderProfiles.value = [
+      profile,
+      ...savedProviderProfiles.value.filter((item) => item.id !== profile.id)
+    ]
+    selectedProviderId.value = profile.id
+    apiKey.value = ''
+    onProviderChange()
+    providerStatus.value = profile.hasApiKey ? '供应商档案和 API Key 已安全保存' : '供应商档案已保存'
+  } catch (error) {
+    providerError.value = error instanceof Error ? error.message : '供应商档案保存失败'
+  } finally {
+    isSavingProvider.value = false
+  }
+}
+
+const deleteProviderProfile = async (): Promise<void> => {
+  providerError.value = ''
+  providerStatus.value = ''
+
+  if (!window.perler?.ai || !selectedProvider.value?.isSavedProfile) {
+    providerError.value = '只能删除已保存的供应商档案'
+    return
+  }
+
+  isDeletingProvider.value = true
+
+  try {
+    const profileId = selectedProviderId.value
+    const result = await window.perler.ai.deleteProviderProfile(profileId)
+    secureStorageAvailable.value = result.secureStorageAvailable
+
+    if (!result.ok) {
+      providerError.value = result.error ?? '供应商档案删除失败'
+      return
+    }
+
+    savedProviderProfiles.value = savedProviderProfiles.value.filter((profile) => profile.id !== profileId)
+    selectedProviderId.value = aiProviderPresets[0].id
+    onProviderChange()
+    providerStatus.value = '供应商档案已删除'
+  } catch (error) {
+    providerError.value = error instanceof Error ? error.message : '供应商档案删除失败'
+  } finally {
+    isDeletingProvider.value = false
+  }
+}
+
+const toggleSelectedModelCapability = (capability: AiModelCapability): void => {
+  const model = selectedModel.value
+  if (!model) return
+
+  const currentCapabilities = capabilitiesByModel.value[model] ?? []
+  const nextCapabilities = currentCapabilities.includes(capability)
+    ? currentCapabilities.filter((item) => item !== capability)
+    : [...currentCapabilities, capability]
+
+  capabilitiesByModel.value = {
+    ...capabilitiesByModel.value,
+    [model]: nextCapabilities
+  }
 }
 
 const getPatternGenerationOptions = () => ({
   boardSize: selectedBoardSize.value,
   maxColors: maxColors.value,
   dithering: enableDithering.value,
+  cleanup: enablePixelCleanup.value,
   palette: activePaletteColors.value
 })
+
+interface CanvasMetrics {
+  canvasSize: number
+  gridX: number
+  gridY: number
+  gridSize: number
+  cellSize: number
+  labelSize: number
+  padding: number
+}
+
+const getCanvasMetrics = (canvasSize: number): CanvasMetrics => {
+  const padding = Math.max(10, Math.min(16, canvasSize * 0.028))
+  const labelSize = showGridLabels.value ? Math.max(22, Math.min(32, canvasSize * 0.056)) : 0
+  const availableSize = Math.max(1, canvasSize - padding * 2 - labelSize * 2)
+  const gridSize = Math.floor(availableSize)
+
+  return {
+    canvasSize,
+    gridX: padding + labelSize,
+    gridY: padding + labelSize,
+    gridSize,
+    cellSize: gridSize / Math.max(1, previewColumns.value),
+    labelSize,
+    padding
+  }
+}
+
+const drawRoundedRect = (
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number
+): void => {
+  const safeRadius = Math.min(radius, width / 2, height / 2)
+
+  context.beginPath()
+  context.moveTo(x + safeRadius, y)
+  context.lineTo(x + width - safeRadius, y)
+  context.quadraticCurveTo(x + width, y, x + width, y + safeRadius)
+  context.lineTo(x + width, y + height - safeRadius)
+  context.quadraticCurveTo(x + width, y + height, x + width - safeRadius, y + height)
+  context.lineTo(x + safeRadius, y + height)
+  context.quadraticCurveTo(x, y + height, x, y + height - safeRadius)
+  context.lineTo(x, y + safeRadius)
+  context.quadraticCurveTo(x, y, x + safeRadius, y)
+  context.closePath()
+}
+
+const drawPatternCanvas = (): void => {
+  const canvas = patternCanvas.value
+  const frame = patternCanvasFrame.value
+  if (!canvas || !frame) return
+
+  const frameRect = frame.getBoundingClientRect()
+  const cssSize = Math.max(1, Math.floor(Math.min(frameRect.width, frameRect.height)))
+  const pixelRatio = Math.max(1, window.devicePixelRatio || 1)
+  const pixelSize = Math.floor(cssSize * pixelRatio)
+
+  if (canvas.width !== pixelSize || canvas.height !== pixelSize) {
+    canvas.width = pixelSize
+    canvas.height = pixelSize
+    canvas.style.width = `${cssSize}px`
+    canvas.style.height = `${cssSize}px`
+  }
+
+  const context = canvas.getContext('2d')
+  if (!context) return
+
+  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
+  context.clearRect(0, 0, cssSize, cssSize)
+
+  const isDark = resolvedTheme.value === 'dark'
+  const metrics = getCanvasMetrics(cssSize)
+  const cells = beadCells.value
+  const rows = previewRows.value
+  const columns = previewColumns.value
+  const cellSize = metrics.cellSize
+
+  context.fillStyle = isDark ? '#2a2723' : '#ffffff'
+  drawRoundedRect(context, 0, 0, cssSize, cssSize, 8)
+  context.fill()
+
+  if (showGridLabels.value) {
+    context.fillStyle = isDark ? '#d8d2c7' : '#5f564b'
+    context.font = `700 ${Math.max(9, Math.min(12, metrics.labelSize * 0.36))}px Inter, ui-sans-serif, system-ui, sans-serif`
+    context.textAlign = 'center'
+    context.textBaseline = 'middle'
+
+    for (let x = 0; x < columns; x += 1) {
+      const label = x + 1
+      if (!shouldShowGridLabel(label, columns)) continue
+
+      const labelX = metrics.gridX + x * cellSize + cellSize / 2
+      context.fillText(String(label), labelX, metrics.padding + metrics.labelSize / 2)
+    }
+
+    for (let y = 0; y < rows; y += 1) {
+      const label = y + 1
+      if (!shouldShowGridLabel(label, rows)) continue
+
+      const labelY = metrics.gridY + y * cellSize + cellSize / 2
+      context.fillText(String(label), metrics.padding + metrics.labelSize * 0.5, labelY)
+    }
+  }
+
+  context.fillStyle = isDark ? '#191715' : '#f8f7f4'
+  context.fillRect(metrics.gridX, metrics.gridY, metrics.gridSize, metrics.gridSize)
+
+  for (let index = 0; index < cells.length; index += 1) {
+    const color = cells[index]
+    const x = index % columns
+    const y = Math.floor(index / columns)
+    const cellX = metrics.gridX + x * cellSize
+    const cellY = metrics.gridY + y * cellSize
+    const inset = Math.max(0.8, Math.min(2.2, cellSize * 0.1))
+
+    if (isEmptyCell(color)) {
+      context.fillStyle = (x + y) % 2 === 0 ? (isDark ? '#211f1c' : '#ffffff') : (isDark ? '#25221f' : '#f3f0ea')
+      context.fillRect(cellX, cellY, cellSize, cellSize)
+      continue
+    }
+
+    context.fillStyle = color
+    drawRoundedRect(
+      context,
+      cellX + inset,
+      cellY + inset,
+      Math.max(0.5, cellSize - inset * 2),
+      Math.max(0.5, cellSize - inset * 2),
+      Math.max(1, cellSize * 0.14)
+    )
+    context.fill()
+
+    if (cellSize >= 7) {
+      context.fillStyle = 'rgb(255 255 255 / 0.22)'
+      context.beginPath()
+      context.arc(cellX + cellSize * 0.36, cellY + cellSize * 0.32, Math.max(0.8, cellSize * 0.11), 0, Math.PI * 2)
+      context.fill()
+    }
+  }
+
+  context.strokeStyle = isDark ? 'rgb(255 255 255 / 0.12)' : 'rgb(25 23 21 / 0.14)'
+  context.lineWidth = 1
+
+  for (let x = 0; x <= columns; x += 1) {
+    const lineX = Math.round(metrics.gridX + x * cellSize) + 0.5
+
+    context.beginPath()
+    context.moveTo(lineX, metrics.gridY)
+    context.lineTo(lineX, metrics.gridY + metrics.gridSize)
+    context.stroke()
+  }
+
+  for (let y = 0; y <= rows; y += 1) {
+    const lineY = Math.round(metrics.gridY + y * cellSize) + 0.5
+
+    context.beginPath()
+    context.moveTo(metrics.gridX, lineY)
+    context.lineTo(metrics.gridX + metrics.gridSize, lineY)
+    context.stroke()
+  }
+
+  context.strokeStyle = isDark ? 'rgb(255 255 255 / 0.42)' : 'rgb(25 23 21 / 0.48)'
+  context.lineWidth = 1.5
+
+  for (let x = 0; x <= columns; x += 5) {
+    const lineX = Math.round(metrics.gridX + x * cellSize) + 0.5
+
+    context.beginPath()
+    context.moveTo(lineX, metrics.gridY)
+    context.lineTo(lineX, metrics.gridY + metrics.gridSize)
+    context.stroke()
+  }
+
+  for (let y = 0; y <= rows; y += 5) {
+    const lineY = Math.round(metrics.gridY + y * cellSize) + 0.5
+
+    context.beginPath()
+    context.moveTo(metrics.gridX, lineY)
+    context.lineTo(metrics.gridX + metrics.gridSize, lineY)
+    context.stroke()
+  }
+
+  context.strokeStyle = isDark ? 'rgb(255 255 255 / 0.55)' : 'rgb(25 23 21 / 0.55)'
+  context.lineWidth = 2
+  context.strokeRect(metrics.gridX + 0.5, metrics.gridY + 0.5, metrics.gridSize - 1, metrics.gridSize - 1)
+}
+
+const getCanvasCellIndex = (event: MouseEvent): number | null => {
+  const canvas = patternCanvas.value
+  if (!canvas) return null
+
+  const rect = canvas.getBoundingClientRect()
+  const canvasSize = Math.min(rect.width, rect.height)
+  const metrics = getCanvasMetrics(canvasSize)
+  const x = event.clientX - rect.left
+  const y = event.clientY - rect.top
+
+  if (
+    x < metrics.gridX ||
+    y < metrics.gridY ||
+    x >= metrics.gridX + metrics.gridSize ||
+    y >= metrics.gridY + metrics.gridSize
+  ) {
+    return null
+  }
+
+  const column = Math.min(previewColumns.value - 1, Math.floor((x - metrics.gridX) / metrics.cellSize))
+  const row = Math.min(previewRows.value - 1, Math.floor((y - metrics.gridY) / metrics.cellSize))
+
+  return row * previewColumns.value + column
+}
+
+const onCanvasClick = (event: MouseEvent): void => {
+  const index = getCanvasCellIndex(event)
+  if (index === null) return
+
+  onCellClick(index)
+}
+
+const syncPatternFullscreenState = (): void => {
+  isPatternFullscreen.value = document.fullscreenElement === patternPreviewPanel.value || isPatternOverlayFullscreen.value
+  void nextTick(drawPatternCanvas)
+}
+
+const togglePatternFullscreen = async (): Promise<void> => {
+  generationError.value = ''
+
+  try {
+    if (isPatternOverlayFullscreen.value) {
+      isPatternOverlayFullscreen.value = false
+      syncPatternFullscreenState()
+      return
+    }
+
+    if (document.fullscreenElement === patternPreviewPanel.value) {
+      await document.exitFullscreen()
+      return
+    }
+
+    if (document.fullscreenElement) {
+      await document.exitFullscreen()
+    }
+
+    await patternPreviewPanel.value?.requestFullscreen()
+
+    if (document.fullscreenElement !== patternPreviewPanel.value) {
+      isPatternOverlayFullscreen.value = true
+    }
+  } catch (error) {
+    isPatternOverlayFullscreen.value = true
+    if (error instanceof Error) {
+      console.warn(error.message)
+    }
+  } finally {
+    syncPatternFullscreenState()
+  }
+}
+
+const onPatternPreviewKeydown = (event: KeyboardEvent): void => {
+  if (event.key !== 'Escape' || !isPatternOverlayFullscreen.value) return
+
+  isPatternOverlayFullscreen.value = false
+  syncPatternFullscreenState()
+}
 
 const getDisplayFileName = (filePath: string): string => {
   return filePath.split(/[\\/]/).pop() ?? filePath
@@ -183,6 +649,7 @@ const buildSavedProject = (): SavedProject => {
       boardSize: selectedBoardSize.value,
       maxColors: maxColors.value,
       dithering: enableDithering.value,
+      cleanup: enablePixelCleanup.value,
       showLabels: showGridLabels.value
     },
     pattern: {
@@ -206,6 +673,7 @@ const applySavedProject = (project: SavedProject, displayName: string): void => 
   selectedBoardSize.value = project.board.boardSize
   maxColors.value = project.board.maxColors
   enableDithering.value = project.board.dithering
+  enablePixelCleanup.value = project.board.cleanup ?? true
   showGridLabels.value = project.board.showLabels
   patternGrid.value = {
     columns: project.pattern.columns,
@@ -214,6 +682,8 @@ const applySavedProject = (project: SavedProject, displayName: string): void => 
     sourceName: project.pattern.sourceName
   }
   selectedProviderId.value = project.ai.providerId
+  const matchingProvider = aiProviderOptions.value.find((provider) => provider.id === project.ai.providerId)
+  providerName.value = matchingProvider?.name ?? project.ai.providerId
   baseUrl.value = project.ai.baseUrl
   selectedMode.value = project.ai.optimizationMode
 
@@ -222,6 +692,7 @@ const applySavedProject = (project: SavedProject, displayName: string): void => 
   }
 
   selectedModel.value = project.ai.modelId
+  capabilitiesByModel.value = { ...(matchingProvider?.capabilitiesByModel ?? {}) }
   sourceFile.value = null
   aiReferenceDataUrl.value = ''
   aiReferenceName.value = ''
@@ -475,7 +946,7 @@ const fetchModels = async (): Promise<void> => {
     return
   }
 
-  if (!apiKey.value.trim()) {
+  if (!apiKey.value.trim() && !canUseStoredApiKey.value) {
     modelError.value = '请先填写 API Key'
     return
   }
@@ -484,7 +955,11 @@ const fetchModels = async (): Promise<void> => {
 
   try {
     const result = window.perler?.ai
-      ? await window.perler.ai.listModels({ baseUrl: baseUrl.value, apiKey: apiKey.value })
+      ? await window.perler.ai.listModels({
+          baseUrl: baseUrl.value,
+          apiKey: apiKey.value,
+          providerProfileId: selectedProvider.value?.isSavedProfile ? selectedProviderId.value : undefined
+        })
       : await listModelsInBrowser()
 
     if (!result.ok) {
@@ -497,8 +972,9 @@ const fetchModels = async (): Promise<void> => {
       return
     }
 
+    const previousModel = selectedModel.value
     modelOptions.value = result.models.map((model) => model.id)
-    selectedModel.value = modelOptions.value[0]
+    selectedModel.value = modelOptions.value.includes(previousModel) ? previousModel : modelOptions.value[0]
     modelStatus.value = `已拉取 ${result.models.length} 个模型`
   } catch (error) {
     modelError.value = error instanceof Error ? error.message : '模型拉取失败'
@@ -524,7 +1000,7 @@ const optimizeImageWithAi = async (): Promise<void> => {
     return
   }
 
-  if (!apiKey.value.trim()) {
+  if (!apiKey.value.trim() && !canUseStoredApiKey.value) {
     aiOptimizeError.value = '请先填写 API Key'
     return
   }
@@ -546,6 +1022,7 @@ const optimizeImageWithAi = async (): Promise<void> => {
     const request: AiImageOptimizationRequest = {
       baseUrl: baseUrl.value,
       apiKey: apiKey.value,
+      providerProfileId: selectedProvider.value?.isSavedProfile ? selectedProviderId.value : undefined,
       model: selectedModel.value,
       optimizationMode: selectedMode.value,
       imageDataUrl,
@@ -635,7 +1112,7 @@ const onImageSelected = async (event: Event): Promise<void> => {
   input.value = ''
 }
 
-watch([selectedManufacturer, selectedBoardSize, maxColors, enableDithering], () => {
+watch([selectedManufacturer, selectedBoardSize, maxColors, enableDithering, enablePixelCleanup], () => {
   if (isApplyingProject) return
 
   const paletteColors = activePaletteColors.value
@@ -770,6 +1247,20 @@ const exportPattern = (): void => {
   }
 }
 
+const printPattern = (): void => {
+  try {
+    printPatternSheet(patternGrid.value, {
+      showLabels: showGridLabels.value,
+      palette: activePaletteColors.value,
+      manufacturer: activeManufacturerPalette.value.name,
+      title: patternGrid.value.sourceName
+    })
+    generationMessage.value = '打印预览已调用，可另存为 PDF'
+  } catch (error) {
+    generationError.value = error instanceof Error ? error.message : '打印失败'
+  }
+}
+
 const exportInventory = (): void => {
   try {
     exportBeadInventoryAsCsv(patternGrid.value, activePaletteColors.value, activeManufacturerPalette.value.name)
@@ -778,6 +1269,37 @@ const exportInventory = (): void => {
     generationError.value = error instanceof Error ? error.message : '导出失败'
   }
 }
+
+watch(selectedModel, () => {
+  if (selectedModel.value && !modelOptions.value.includes(selectedModel.value)) {
+    modelOptions.value = [selectedModel.value, ...modelOptions.value]
+  }
+})
+
+watch([patternGrid, showGridLabels, resolvedTheme], () => {
+  void nextTick(drawPatternCanvas)
+}, { deep: true })
+
+onMounted(() => {
+  void loadProviderProfiles()
+  document.addEventListener('fullscreenchange', syncPatternFullscreenState)
+  document.addEventListener('keydown', onPatternPreviewKeydown)
+  void nextTick(() => {
+    drawPatternCanvas()
+
+    if (patternCanvasFrame.value) {
+      canvasResizeObserver = new ResizeObserver(() => drawPatternCanvas())
+      canvasResizeObserver.observe(patternCanvasFrame.value)
+    }
+  })
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('fullscreenchange', syncPatternFullscreenState)
+  document.removeEventListener('keydown', onPatternPreviewKeydown)
+  canvasResizeObserver?.disconnect()
+  canvasResizeObserver = null
+})
 </script>
 
 <template>
@@ -902,6 +1424,15 @@ const exportInventory = (): void => {
           <button
             class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
             type="button"
+            title="打印或另存为 PDF"
+            @click="printPattern"
+          >
+            <Icon icon="ri:printer-line" class="h-4 w-4" />
+            <span>打印</span>
+          </button>
+          <button
+            class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+            type="button"
             title="导出 PNG 图纸"
             @click="exportPattern"
           >
@@ -969,6 +1500,13 @@ const exportInventory = (): void => {
             >
               <span class="text-sm">开启抖色</span>
               <input v-model="enableDithering" class="h-4 w-4 accent-bead-mint" type="checkbox" />
+            </label>
+
+            <label
+              class="flex items-center justify-between rounded-md border border-ink-100 px-3 py-2 dark:border-white/10"
+            >
+              <span class="text-sm">像素清理</span>
+              <input v-model="enablePixelCleanup" class="h-4 w-4 accent-bead-amber" type="checkbox" />
             </label>
 
             <label
@@ -1072,7 +1610,9 @@ const exportInventory = (): void => {
         </section>
 
         <section
-          class="flex min-h-0 flex-col rounded-md border border-ink-100 bg-white shadow-panel dark:border-white/10 dark:bg-ink-800"
+          ref="patternPreviewPanel"
+          class="pattern-preview-panel flex min-h-0 flex-col rounded-md border border-ink-100 bg-white shadow-panel dark:border-white/10 dark:bg-ink-800"
+          :class="{ 'is-overlay-fullscreen': isPatternOverlayFullscreen }"
         >
           <div class="flex items-center justify-between border-b border-ink-100 px-4 py-3 dark:border-white/10">
             <div class="flex items-center gap-2">
@@ -1113,58 +1653,36 @@ const exportInventory = (): void => {
               >
                 <Icon :icon="tool.icon" class="h-4 w-4" />
               </button>
+              <button
+                class="rounded-md p-2 text-ink-600 transition hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10"
+                type="button"
+                :title="isPatternFullscreen ? '退出全屏' : '全屏预览'"
+                @click="togglePatternFullscreen"
+              >
+                <Icon :icon="isPatternFullscreen ? 'ri:fullscreen-exit-line' : 'ri:fullscreen-line'" class="h-4 w-4" />
+              </button>
             </div>
           </div>
 
           <div class="flex min-h-0 flex-1 items-center justify-center bg-ink-50 p-5 dark:bg-ink-900">
             <div
-              class="aspect-square w-full max-w-[620px] rounded-md border border-ink-200 bg-white p-3 shadow-panel dark:border-white/10 dark:bg-ink-800"
+              class="pattern-canvas-shell aspect-square w-full max-w-[620px] rounded-md border border-ink-200 bg-white p-3 shadow-panel dark:border-white/10 dark:bg-ink-800"
             >
-              <div class="flex h-full w-full flex-col gap-1">
-                <div
-                  v-if="showGridLabels"
-                  class="ml-7 grid h-5 shrink-0 items-center text-center text-[9px] font-medium leading-none text-ink-500 dark:text-ink-300"
-                  :style="{ gridTemplateColumns: `repeat(${previewColumns}, minmax(0, 1fr))` }"
-                >
-                  <span v-for="(label, index) in columnLabels" :key="`column-${index}`">
-                    {{ label }}
-                  </span>
-                </div>
-
-                <div class="flex min-h-0 flex-1 gap-1">
-                  <div
-                    v-if="showGridLabels"
-                    class="grid w-6 shrink-0 items-center text-right text-[9px] font-medium leading-none text-ink-500 dark:text-ink-300"
-                    :style="{ gridTemplateRows: `repeat(${previewRows}, minmax(0, 1fr))` }"
-                  >
-                    <span v-for="(label, index) in rowLabels" :key="`row-${index}`">
-                      {{ label }}
-                    </span>
-                  </div>
-
-                  <div class="flex min-h-0 flex-1 items-center justify-center">
-                    <div
-                      class="grid aspect-square h-full max-h-full max-w-full gap-px rounded bg-ink-200 p-1 dark:bg-black/30"
-                      :style="{ gridTemplateColumns: `repeat(${previewColumns}, minmax(0, 1fr))` }"
-                    >
-                      <button
-                        v-for="(color, index) in beadCells"
-                        :key="index"
-                        class="bead-cell aspect-square rounded-[2px] outline-none transition hover:scale-110 focus:scale-110 focus:ring-1 focus:ring-bead-coral"
-                        :style="{ backgroundColor: getCellBackgroundColor(color) }"
-                        type="button"
-                        :title="getCellTitle(color, index)"
-                        @click="onCellClick(index)"
-                      ></button>
-                    </div>
-                  </div>
-                </div>
+              <div ref="patternCanvasFrame" class="flex h-full w-full items-center justify-center">
+                <canvas
+                  ref="patternCanvas"
+                  class="h-full max-h-full max-w-full cursor-crosshair rounded-md outline-none focus:ring-2 focus:ring-bead-coral"
+                  role="img"
+                  tabindex="0"
+                  :aria-label="`拼豆图纸预览，${previewColumns} x ${previewRows}`"
+                  @click="onCanvasClick"
+                ></canvas>
               </div>
             </div>
           </div>
 
           <div
-            class="grid grid-cols-5 gap-3 border-t border-ink-100 px-4 py-3 text-sm dark:border-white/10"
+            class="grid grid-cols-6 gap-3 border-t border-ink-100 px-4 py-3 text-sm dark:border-white/10"
           >
             <div>
               <span class="block text-xs text-ink-500 dark:text-ink-400">格子</span>
@@ -1185,6 +1703,10 @@ const exportInventory = (): void => {
             <div>
               <span class="block text-xs text-ink-500 dark:text-ink-400">标号</span>
               <strong>{{ showGridLabels ? '显示' : '隐藏' }}</strong>
+            </div>
+            <div>
+              <span class="block text-xs text-ink-500 dark:text-ink-400">清理</span>
+              <strong>{{ enablePixelCleanup ? '开启' : '关闭' }}</strong>
             </div>
           </div>
         </section>
@@ -1207,16 +1729,25 @@ const exportInventory = (): void => {
             />
 
             <label class="block space-y-1.5">
-              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">供应商</span>
+              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">供应商档案</span>
               <select
                 v-model="selectedProviderId"
                 class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
                 @change="onProviderChange"
               >
-                <option v-for="provider in aiProviderPresets" :key="provider.id" :value="provider.id">
-                  {{ provider.name }}
+                <option v-for="provider in aiProviderOptions" :key="provider.id" :value="provider.id">
+                  {{ provider.name }}{{ provider.isSavedProfile ? ' · 已保存' : '' }}
                 </option>
               </select>
+            </label>
+
+            <label class="block space-y-1.5">
+              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">档案名称</span>
+              <input
+                v-model="providerName"
+                class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
+                type="text"
+              />
             </label>
 
             <label class="block space-y-1.5">
@@ -1234,10 +1765,48 @@ const exportInventory = (): void => {
                 v-model="apiKey"
                 class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
                 autocomplete="new-password"
-                placeholder="sk-..."
+                :placeholder="selectedProviderHasStoredKey ? '已安全保存，可留空' : 'sk-...'"
                 type="password"
               />
             </label>
+
+            <div class="grid grid-cols-2 gap-2">
+              <button
+                class="inline-flex items-center justify-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 disabled:opacity-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+                type="button"
+                title="保存供应商档案"
+                :disabled="isSavingProvider"
+                @click="saveProviderProfile"
+              >
+                <Icon icon="ri:save-3-line" class="h-4 w-4" :class="isSavingProvider ? 'animate-spin' : ''" />
+                <span>保存档案</span>
+              </button>
+              <button
+                class="inline-flex items-center justify-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 disabled:opacity-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
+                type="button"
+                title="删除供应商档案"
+                :disabled="!selectedProvider.isSavedProfile || isDeletingProvider"
+                @click="deleteProviderProfile"
+              >
+                <Icon icon="ri:delete-bin-line" class="h-4 w-4" :class="isDeletingProvider ? 'animate-spin' : ''" />
+                <span>删除</span>
+              </button>
+            </div>
+
+            <p
+              v-if="providerStatus || providerError || (isDesktopAiRuntime && !secureStorageAvailable)"
+              class="rounded-md border px-3 py-2 text-xs"
+              :class="
+                providerError || (isDesktopAiRuntime && !secureStorageAvailable)
+                  ? 'border-bead-coral/30 bg-bead-coral/10 text-bead-coral'
+                  : 'border-bead-sky/30 bg-bead-sky/10 text-ink-700 dark:text-ink-100'
+              "
+            >
+              {{
+                providerError ||
+                (!secureStorageAvailable ? '当前系统安全存储不可用，API Key 未保存' : providerStatus)
+              }}
+            </p>
 
             <div class="grid grid-cols-[1fr_auto] gap-2">
               <label class="block space-y-1.5">
@@ -1317,21 +1886,22 @@ const exportInventory = (): void => {
               <h3 class="text-sm font-semibold">模型能力</h3>
             </div>
             <div class="flex flex-wrap gap-2">
-              <span
-                class="rounded-full border border-bead-mint/40 bg-bead-mint/10 px-3 py-1 text-xs text-ink-700 dark:text-ink-100"
+              <button
+                v-for="capability in capabilityOptions"
+                :key="capability.id"
+                class="inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs transition"
+                :class="
+                  selectedModelCapabilities.includes(capability.id)
+                    ? 'border-bead-sky/50 bg-bead-sky/15 text-ink-900 dark:text-ink-50'
+                    : 'border-ink-200 text-ink-600 hover:bg-ink-50 dark:border-white/10 dark:text-ink-300 dark:hover:bg-white/5'
+                "
+                type="button"
+                :title="capability.label"
+                @click="toggleSelectedModelCapability(capability.id)"
               >
-                图片生成
-              </span>
-              <span
-                class="rounded-full border border-bead-sky/40 bg-bead-sky/10 px-3 py-1 text-xs text-ink-700 dark:text-ink-100"
-              >
-                图片编辑
-              </span>
-              <span
-                class="rounded-full border border-bead-amber/40 bg-bead-amber/10 px-3 py-1 text-xs text-ink-700 dark:text-ink-100"
-              >
-                多模态理解
-              </span>
+                <Icon :icon="capability.icon" class="h-3.5 w-3.5" />
+                <span>{{ capability.label }}</span>
+              </button>
             </div>
           </div>
         </section>
