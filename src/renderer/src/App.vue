@@ -58,10 +58,21 @@ interface AiProviderOption {
   isSavedProfile: boolean
 }
 
+interface BrowserStoredAiProviderProfile extends Omit<AiProviderProfile, 'hasApiKey'> {
+  apiKey?: string
+}
+
+interface BrowserStoredAiProviderProfilesStorage {
+  schemaVersion: 1
+  profiles: BrowserStoredAiProviderProfile[]
+}
+
 const { preference, resolvedTheme, setPreference, cycleTheme } = useTheme()
 
 const boardSizes = ['32 x 32', '48 x 48', '64 x 64', '96 x 96']
 const defaultAiOptimizationMode = '拼豆图纸优化'
+const browserAiProviderProfilesStorageKey = 'perler.aiProviderProfiles.v1'
+const aiModelCapabilities = ['image-generation', 'image-editing', 'vision', 'text'] satisfies AiModelCapability[]
 const aiCreationModes: Array<{ id: AiCreationMode; label: string; description: string }> = [
   { id: 'generate', label: '普通生成', description: '直接用本地确定性逻辑生成图纸' },
   { id: 'optimize', label: 'AI 优化', description: '先优化原图，再生成图纸' }
@@ -236,7 +247,31 @@ const selectedProvider = computed(() => {
 
 const selectedProviderHasStoredKey = computed(() => selectedProvider.value?.isSavedProfile === true && selectedProvider.value.hasApiKey)
 const isDesktopAiRuntime = computed(() => window.perler?.ai !== undefined)
-const canUseStoredApiKey = computed(() => window.perler?.ai !== undefined && selectedProviderHasStoredKey.value)
+const canUseStoredApiKey = computed(() => {
+  if (!selectedProviderHasStoredKey.value) return false
+  if (window.perler?.ai) return true
+
+  return Boolean(getBrowserStoredApiKey(selectedProviderId.value))
+})
+const apiSettingsDescription = computed(() =>
+  isDesktopAiRuntime.value
+    ? '管理平台地址、模型列表和 Key。Key 写入后端安全存储，页面不会显示完整内容。'
+    : '管理平台地址、模型列表和 Key。Web 预览会保存到当前浏览器本地存储，页面不会显示完整内容。'
+)
+const apiKeyStorageHint = computed(() => {
+  if (selectedProviderHasStoredKey.value) return '当前 Key 已保存，可留空继续使用'
+
+  return isDesktopAiRuntime.value
+    ? 'Key 仅保存到桌面端安全存储，不写入项目文件'
+    : 'Key 保存到当前浏览器本地存储，不写入项目文件'
+})
+const providerNoticeIsError = computed(() => Boolean(providerError.value || (isDesktopAiRuntime.value && !secureStorageAvailable.value)))
+const providerNoticeMessage = computed(() => {
+  if (providerError.value) return providerError.value
+  if (isDesktopAiRuntime.value && !secureStorageAvailable.value) return '当前系统安全存储不可用，API Key 未保存'
+
+  return providerStatus.value
+})
 const isAiOptimizeMode = computed(() => aiCreationMode.value === 'optimize')
 const aiOptimizeElapsedLabel = computed(() => {
   const minutes = Math.floor(aiOptimizeElapsedSeconds.value / 60)
@@ -344,6 +379,144 @@ const syncModelSelection = (): void => {
   }
 }
 
+const createBrowserProviderProfileId = (): string => {
+  return `provider-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+const isValidAiModelCapability = (value: unknown): value is AiModelCapability => {
+  return typeof value === 'string' && aiModelCapabilities.includes(value as AiModelCapability)
+}
+
+const normalizeProviderModels = (models: string[], selectedModelValue: string): string[] => {
+  const uniqueModels = [...new Set(models.map((model) => model.trim()).filter(Boolean))]
+  const normalizedSelectedModel = selectedModelValue.trim()
+
+  if (normalizedSelectedModel && !uniqueModels.includes(normalizedSelectedModel)) {
+    uniqueModels.unshift(normalizedSelectedModel)
+  }
+
+  return uniqueModels
+}
+
+const isBrowserStoredAiProviderProfile = (value: unknown): value is BrowserStoredAiProviderProfile => {
+  if (!isRecord(value)) return false
+  if (typeof value.id !== 'string' || typeof value.name !== 'string' || typeof value.baseUrl !== 'string') {
+    return false
+  }
+  if (!Array.isArray(value.models) || !value.models.every((model) => typeof model === 'string')) return false
+  if (typeof value.selectedModel !== 'string' || typeof value.updatedAt !== 'string') return false
+  if (value.apiKey !== undefined && typeof value.apiKey !== 'string') return false
+  if (!isRecord(value.capabilitiesByModel)) return false
+
+  return Object.values(value.capabilitiesByModel).every((capabilities) => {
+    return Array.isArray(capabilities) && capabilities.every(isValidAiModelCapability)
+  })
+}
+
+const readBrowserStoredProviderProfiles = (): BrowserStoredAiProviderProfile[] => {
+  try {
+    const content = window.localStorage.getItem(browserAiProviderProfilesStorageKey)
+    if (!content) return []
+
+    const payload = JSON.parse(content) as unknown
+    if (!isRecord(payload) || payload.schemaVersion !== 1 || !Array.isArray(payload.profiles)) return []
+
+    return payload.profiles.filter(isBrowserStoredAiProviderProfile)
+  } catch {
+    return []
+  }
+}
+
+const writeBrowserStoredProviderProfiles = (profiles: BrowserStoredAiProviderProfile[]): void => {
+  const payload: BrowserStoredAiProviderProfilesStorage = {
+    schemaVersion: 1,
+    profiles
+  }
+
+  window.localStorage.setItem(browserAiProviderProfilesStorageKey, JSON.stringify(payload))
+}
+
+const toPublicBrowserProviderProfile = (profile: BrowserStoredAiProviderProfile): AiProviderProfile => {
+  return {
+    id: profile.id,
+    name: profile.name,
+    baseUrl: profile.baseUrl,
+    models: profile.models,
+    selectedModel: profile.selectedModel,
+    capabilitiesByModel: profile.capabilitiesByModel,
+    hasApiKey: Boolean(profile.apiKey?.trim()),
+    updatedAt: profile.updatedAt
+  }
+}
+
+const getBrowserStoredApiKey = (profileId: string): string => {
+  const profile = readBrowserStoredProviderProfiles().find((item) => item.id === profileId)
+
+  return profile?.apiKey?.trim() ?? ''
+}
+
+const getEffectiveBrowserApiKey = (): string => {
+  const typedApiKey = apiKey.value.trim()
+  if (typedApiKey) return typedApiKey
+  if (!selectedProvider.value?.isSavedProfile) return ''
+
+  return getBrowserStoredApiKey(selectedProviderId.value)
+}
+
+const selectAvailableProviderProfile = (): boolean => {
+  const selected = aiProviderOptions.value.find((provider) => provider.id === selectedProviderId.value)
+
+  if (selected) {
+    onProviderChange()
+    return true
+  }
+
+  if (!providerName.value && aiProviderOptions.value[0]) {
+    selectedProviderId.value = aiProviderOptions.value[0].id
+    onProviderChange()
+    return true
+  }
+
+  return false
+}
+
+const saveBrowserProviderProfile = (): AiProviderProfile => {
+  const storedProfiles = readBrowserStoredProviderProfiles()
+  const profileId = selectedProvider.value?.isSavedProfile ? selectedProviderId.value : createBrowserProviderProfileId()
+  const existingProfile = storedProfiles.find((profile) => profile.id === profileId)
+  const selectedModelValue = selectedModel.value.trim()
+  const models = normalizeProviderModels(modelOptions.value, selectedModelValue)
+  const modelSet = new Set(models)
+  const capabilitiesByImageModel = Object.fromEntries(
+    Object.entries({
+      ...capabilitiesByModel.value,
+      [selectedModelValue]: ['image-generation' as AiModelCapability]
+    })
+      .filter(([model]) => modelSet.has(model))
+      .map(([model, capabilities]) => [model, [...new Set(capabilities)]])
+  )
+  const nextProfile: BrowserStoredAiProviderProfile = {
+    id: profileId,
+    name: providerName.value.trim(),
+    baseUrl: baseUrl.value.trim(),
+    models,
+    selectedModel: selectedModelValue,
+    capabilitiesByModel: capabilitiesByImageModel,
+    apiKey: apiKey.value.trim() || existingProfile?.apiKey,
+    updatedAt: new Date().toISOString()
+  }
+  const nextProfiles = existingProfile
+    ? storedProfiles.map((profile) => (profile.id === profileId ? nextProfile : profile))
+    : [...storedProfiles, nextProfile]
+
+  writeBrowserStoredProviderProfiles(nextProfiles)
+  return toPublicBrowserProviderProfile(nextProfile)
+}
+
+const deleteBrowserProviderProfile = (profileId: string): void => {
+  writeBrowserStoredProviderProfiles(readBrowserStoredProviderProfiles().filter((profile) => profile.id !== profileId))
+}
+
 const resetProviderForm = (): void => {
   selectedProviderId.value = NEW_PROVIDER_ID
   providerName.value = ''
@@ -377,7 +550,10 @@ const onProviderChange = (): void => {
 const loadProviderProfiles = async (): Promise<void> => {
   if (!window.perler?.ai) {
     secureStorageAvailable.value = false
-    providerStatus.value = 'Web 预览不保存供应商档案'
+    savedProviderProfiles.value = readBrowserStoredProviderProfiles().map(toPublicBrowserProviderProfile)
+    providerStatus.value = selectAvailableProviderProfile()
+      ? '已从浏览器本地存储载入供应商档案'
+      : 'Web 预览会保存供应商档案到当前浏览器'
     return
   }
 
@@ -391,17 +567,7 @@ const loadProviderProfiles = async (): Promise<void> => {
     }
 
     savedProviderProfiles.value = result.profiles
-    const selected = aiProviderOptions.value.find((provider) => provider.id === selectedProviderId.value)
-
-    if (selected) {
-      onProviderChange()
-      return
-    }
-
-    if (!providerName.value && aiProviderOptions.value[0]) {
-      selectedProviderId.value = aiProviderOptions.value[0].id
-      onProviderChange()
-    }
+    selectAvailableProviderProfile()
   } catch (error) {
     providerError.value = error instanceof Error ? error.message : '供应商档案读取失败'
   }
@@ -410,11 +576,6 @@ const loadProviderProfiles = async (): Promise<void> => {
 const saveProviderProfile = async (): Promise<void> => {
   providerError.value = ''
   providerStatus.value = ''
-
-  if (!window.perler?.ai) {
-    providerError.value = 'Web 预览不保存供应商档案，请在桌面端保存'
-    return
-  }
 
   if (!providerName.value.trim()) {
     providerError.value = '请先填写供应商名称'
@@ -438,17 +599,23 @@ const saveProviderProfile = async (): Promise<void> => {
     const capabilitiesByImageModel = {
       [selectedModel.value]: ['image-generation' as AiModelCapability]
     }
-    const result = await window.perler.ai.saveProviderProfile({
-      profile: {
-        id: providerId,
-        name: providerName.value,
-        baseUrl: baseUrl.value,
-        models: [...modelOptions.value],
-        selectedModel: selectedModel.value,
-        capabilitiesByModel: capabilitiesByImageModel
-      },
-      apiKey: apiKey.value || undefined
-    })
+    const result = window.perler?.ai
+      ? await window.perler.ai.saveProviderProfile({
+          profile: {
+            id: providerId,
+            name: providerName.value,
+            baseUrl: baseUrl.value,
+            models: [...modelOptions.value],
+            selectedModel: selectedModel.value,
+            capabilitiesByModel: capabilitiesByImageModel
+          },
+          apiKey: apiKey.value || undefined
+        })
+      : {
+          ok: true,
+          profile: saveBrowserProviderProfile(),
+          secureStorageAvailable: false
+        }
     secureStorageAvailable.value = result.secureStorageAvailable
 
     if (!result.ok || !result.profile) {
@@ -464,7 +631,13 @@ const saveProviderProfile = async (): Promise<void> => {
     selectedProviderId.value = profile.id
     apiKey.value = ''
     onProviderChange()
-    providerStatus.value = profile.hasApiKey ? '供应商档案和 API Key 已安全保存' : '供应商档案已保存'
+    providerStatus.value = window.perler?.ai
+      ? profile.hasApiKey
+        ? '供应商档案和 API Key 已安全保存'
+        : '供应商档案已保存'
+      : profile.hasApiKey
+        ? '供应商档案和 API Key 已保存到浏览器本地存储'
+        : '供应商档案已保存到浏览器本地存储'
   } catch (error) {
     providerError.value = error instanceof Error ? error.message : '供应商档案保存失败'
   } finally {
@@ -476,7 +649,7 @@ const deleteProviderProfile = async (): Promise<void> => {
   providerError.value = ''
   providerStatus.value = ''
 
-  if (!window.perler?.ai || !selectedProvider.value?.isSavedProfile) {
+  if (!selectedProvider.value?.isSavedProfile) {
     providerError.value = '只能删除已保存的供应商档案'
     return
   }
@@ -485,7 +658,17 @@ const deleteProviderProfile = async (): Promise<void> => {
 
   try {
     const profileId = selectedProviderId.value
-    const result = await window.perler.ai.deleteProviderProfile(profileId)
+    const result = window.perler?.ai
+      ? await window.perler.ai.deleteProviderProfile(profileId)
+      : {
+          ok: true,
+          secureStorageAvailable: false
+        }
+
+    if (!window.perler?.ai) {
+      deleteBrowserProviderProfile(profileId)
+    }
+
     secureStorageAvailable.value = result.secureStorageAvailable
 
     if (!result.ok) {
@@ -1387,9 +1570,10 @@ const readRemoteImageAsDataUrlInBrowser = async (url: string): Promise<string> =
 }
 
 const listModelsInBrowser = async (): Promise<AiListModelsResult> => {
+  const effectiveApiKey = getEffectiveBrowserApiKey()
   const response = await fetch(buildAiModelsUrl(baseUrl.value), {
     headers: {
-      Authorization: `Bearer ${apiKey.value}`,
+      Authorization: `Bearer ${effectiveApiKey}`,
       Accept: 'application/json'
     }
   })
@@ -1558,17 +1742,21 @@ const optimizeImageWithAi = async (): Promise<void> => {
   isOptimizingImage.value = true
   startAiOptimizeTimer()
   const runtimeLabel = window.perler?.ai ? '桌面端' : 'Web 预览'
+  const isUsingSavedBrowserKey = !window.perler?.ai && !apiKey.value.trim() && selectedProviderHasStoredKey.value
   generationMessage.value = `正在通过${runtimeLabel}调用 AI 优化原图`
   aiOptimizeStatus.value = window.perler?.ai
     ? '正在优化原图'
-    : 'Web 预览直连中，API Key 仅用于本次请求'
+    : isUsingSavedBrowserKey
+      ? 'Web 预览直连中，正在使用已保存 Key'
+      : 'Web 预览直连中，API Key 仅用于本次请求'
 
   try {
     const imageDataUrl = await readImageFileAsDataUrl(imageFile)
     const { columns: requestBoardColumns, rows: requestBoardRows } = parseBoardSize(selectedBoardSize.value)
+    const effectiveApiKey = window.perler?.ai ? apiKey.value : getEffectiveBrowserApiKey()
     const request: AiImageOptimizationRequest = {
       baseUrl: baseUrl.value,
-      apiKey: apiKey.value,
+      apiKey: effectiveApiKey,
       providerProfileId: selectedProvider.value?.isSavedProfile ? selectedProviderId.value : undefined,
       model: selectedModel.value,
       optimizationMode: defaultAiOptimizationMode,
@@ -2742,7 +2930,7 @@ onBeforeUnmount(() => {
               <h3 class="truncate text-xl font-black tracking-tight">API 设置</h3>
             </div>
             <p class="mt-1 text-xs font-medium text-ink-500 dark:text-ink-400">
-              管理平台地址、模型列表和 Key。Key 写入后端安全存储，页面不会显示完整内容。
+              {{ apiSettingsDescription }}
             </p>
           </div>
           <button
@@ -2908,25 +3096,22 @@ onBeforeUnmount(() => {
                     </button>
                   </div>
                   <span class="text-[11px] font-medium text-ink-500 dark:text-ink-400">
-                    {{ selectedProviderHasStoredKey ? '当前 Key 已保存，可留空继续使用' : 'Key 仅保存到桌面端安全存储，不写入项目文件' }}
+                    {{ apiKeyStorageHint }}
                   </span>
                 </label>
               </div>
             </div>
 
             <p
-              v-if="providerStatus || providerError || (isDesktopAiRuntime && !secureStorageAvailable)"
+              v-if="providerNoticeMessage"
               class="rounded-lg border px-3 py-2 text-xs"
               :class="
-                providerError || (isDesktopAiRuntime && !secureStorageAvailable)
+                providerNoticeIsError
                   ? 'border-bead-coral/30 bg-bead-coral/10 text-bead-coral'
                   : 'border-bead-sky/30 bg-bead-sky/10 text-ink-700 dark:text-ink-100'
               "
             >
-              {{
-                providerError ||
-                (!secureStorageAvailable ? '当前系统安全存储不可用，API Key 未保存' : providerStatus)
-              }}
+              {{ providerNoticeMessage }}
             </p>
 
             <div
