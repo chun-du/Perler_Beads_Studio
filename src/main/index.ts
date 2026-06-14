@@ -118,6 +118,19 @@ const isAiImageOptimizationRequest = (value: unknown): value is AiImageOptimizat
     typeof value.apiKey === 'string' &&
     typeof value.model === 'string' &&
     typeof value.optimizationMode === 'string' &&
+    typeof value.boardColumns === 'number' &&
+    typeof value.boardRows === 'number' &&
+    typeof value.manufacturerName === 'string' &&
+    typeof value.maxColors === 'number' &&
+    Array.isArray(value.paletteColors) &&
+    value.paletteColors.every((color) => {
+      return (
+        isRecord(color) &&
+        typeof color.id === 'string' &&
+        typeof color.name === 'string' &&
+        typeof color.hex === 'string'
+      )
+    }) &&
     typeof value.imageDataUrl === 'string' &&
     (value.prompt === undefined || typeof value.prompt === 'string') &&
     (value.imageName === undefined || typeof value.imageName === 'string')
@@ -547,7 +560,8 @@ const registerAiIpc = (): void => {
       const imageBlob = new Blob([new Uint8Array(image.buffer)], { type: image.mimeType })
 
       body.append('model', request.model.trim())
-      body.append('prompt', createAiImageOptimizationPrompt(request.optimizationMode, request.prompt))
+      body.append('prompt', createAiImageOptimizationPrompt(request))
+      body.append('size', '960x960')
       body.append('image', imageBlob, request.imageName?.trim() || 'source-image.png')
 
       try {
