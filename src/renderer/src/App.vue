@@ -35,6 +35,7 @@ import type { PatternGrid } from './utils/pattern'
 type EditorTool = 'pencil' | 'fill' | 'eyedropper' | 'eraser'
 type PatternInputMode = 'image' | 'pixel-art'
 type AiCreationMode = 'generate' | 'optimize'
+type PatternPreviewMode = 'chart' | 'effect'
 
 interface CanvasPointerState {
   pointerId: number
@@ -136,6 +137,7 @@ const maxColors = ref(24)
 const enableDithering = ref(true)
 const enablePixelCleanup = ref(true)
 const showGridLabels = ref(true)
+const patternPreviewMode = ref<PatternPreviewMode>('chart')
 const activeManufacturerPalette = computed(() => getManufacturerPalette(selectedManufacturer.value))
 const activePaletteColors = computed(() => activeManufacturerPalette.value.colors)
 const createCurrentSamplePattern = (): PatternGrid => {
@@ -144,6 +146,7 @@ const createCurrentSamplePattern = (): PatternGrid => {
 }
 const patternGrid = ref<PatternGrid>(createCurrentSamplePattern())
 const sourceFile = ref<File | null>(null)
+const sourcePreviewDataUrl = ref('')
 const isGenerating = ref(false)
 const isOptimizingImage = ref(false)
 const aiCreationMode = ref<AiCreationMode>('generate')
@@ -181,6 +184,7 @@ const isCanvasDragging = ref(false)
 const isSpacePressed = ref(false)
 const isCanvasStageHovered = ref(false)
 let generationToken = 0
+let sourcePreviewToken = 0
 let isApplyingProject = false
 let canvasResizeObserver: ResizeObserver | null = null
 let aiOptimizeTimer: number | null = null
@@ -253,7 +257,10 @@ const patternStatus = computed(() => {
   if (sourceFile.value && patternGrid.value.sourceName !== sourceFile.value.name && patternGrid.value.sourceName !== aiReferenceName.value) {
     return '待生成'
   }
-  return sourceFile.value ? '已生成' : '草稿'
+  if (aiReferenceDataUrl.value && aiReferenceName.value && patternGrid.value.sourceName !== aiReferenceName.value) {
+    return '待生成'
+  }
+  return sourceFile.value || aiReferenceDataUrl.value ? '已生成' : '草稿'
 })
 
 const beadInventory = computed(() => buildBeadInventory(patternGrid.value, activePaletteColors.value))
@@ -276,8 +283,11 @@ const filteredPaletteColors = computed(() => {
   })
 })
 const canvasZoomPercent = computed(() => Math.round(canvasZoom.value * 100))
+const isActualEffectPreview = computed(() => patternPreviewMode.value === 'effect')
+const activeToolLabel = computed(() => (isActualEffectPreview.value ? '效果预览' : editorTools.find((tool) => tool.id === activeTool.value)?.label ?? '画笔'))
 const canvasCursorClass = computed(() => {
   if (isCanvasDragging.value) return 'cursor-grabbing'
+  if (isActualEffectPreview.value) return 'cursor-grab'
   if (isSpacePressed.value) return 'cursor-grab'
   return 'cursor-crosshair'
 })
@@ -526,7 +536,7 @@ interface CanvasMetrics {
 
 const getCanvasMetrics = (canvasSize: number): CanvasMetrics => {
   const padding = Math.max(10, Math.min(16, canvasSize * 0.028))
-  const labelSize = showGridLabels.value ? Math.max(22, Math.min(32, canvasSize * 0.056)) : 0
+  const labelSize = showGridLabels.value && !isActualEffectPreview.value ? Math.max(22, Math.min(32, canvasSize * 0.056)) : 0
   const availableSize = Math.max(1, canvasSize - padding * 2 - labelSize * 2)
   const gridSize = Math.floor(availableSize)
 
@@ -689,6 +699,90 @@ const drawRoundedRect = (
   context.closePath()
 }
 
+const drawActualEffectCanvas = (
+  context: CanvasRenderingContext2D,
+  metrics: CanvasMetrics,
+  cells: string[],
+  columns: number,
+  isDark: boolean
+): void => {
+  const cellSize = metrics.cellSize
+  const beadRadius = Math.max(0.8, cellSize * 0.42)
+  const holeRadius = Math.max(0.35, beadRadius * 0.28)
+  const canDrawDetails = cellSize >= 4
+  const boardColor = isDark ? '#211f1c' : '#fffdf8'
+  const emptyHoleColor = isDark ? 'rgb(255 255 255 / 0.08)' : 'rgb(25 23 21 / 0.06)'
+
+  context.save()
+  context.shadowColor = isDark ? 'rgb(0 0 0 / 0.28)' : 'rgb(65 54 40 / 0.12)'
+  context.shadowBlur = Math.max(4, cellSize * 0.45)
+  context.shadowOffsetY = Math.max(1, cellSize * 0.08)
+  context.fillStyle = boardColor
+  drawRoundedRect(context, metrics.gridX, metrics.gridY, metrics.gridSize, metrics.gridSize, Math.max(8, cellSize * 1.2))
+  context.fill()
+  context.restore()
+
+  if (cellSize >= 6) {
+    context.fillStyle = emptyHoleColor
+    for (let index = 0; index < cells.length; index += 1) {
+      if (!isEmptyCell(cells[index])) continue
+
+      const x = index % columns
+      const y = Math.floor(index / columns)
+      const centerX = metrics.gridX + x * cellSize + cellSize / 2
+      const centerY = metrics.gridY + y * cellSize + cellSize / 2
+
+      context.beginPath()
+      context.arc(centerX, centerY, Math.max(0.45, cellSize * 0.08), 0, Math.PI * 2)
+      context.fill()
+    }
+  }
+
+  for (let index = 0; index < cells.length; index += 1) {
+    const color = cells[index]
+    if (isEmptyCell(color)) continue
+
+    const x = index % columns
+    const y = Math.floor(index / columns)
+    const centerX = metrics.gridX + x * cellSize + cellSize / 2
+    const centerY = metrics.gridY + y * cellSize + cellSize / 2
+
+    context.save()
+    context.shadowColor = isDark ? 'rgb(0 0 0 / 0.36)' : 'rgb(48 39 31 / 0.18)'
+    context.shadowBlur = Math.max(0.6, cellSize * 0.16)
+    context.shadowOffsetY = Math.max(0.3, cellSize * 0.04)
+    context.fillStyle = color
+    context.beginPath()
+    context.arc(centerX, centerY, beadRadius, 0, Math.PI * 2)
+    context.fill()
+    context.restore()
+
+    if (!canDrawDetails) continue
+
+    context.strokeStyle = isDark ? 'rgb(0 0 0 / 0.25)' : 'rgb(25 23 21 / 0.16)'
+    context.lineWidth = Math.max(0.4, cellSize * 0.045)
+    context.beginPath()
+    context.arc(centerX, centerY, beadRadius, 0, Math.PI * 2)
+    context.stroke()
+
+    context.fillStyle = 'rgb(255 255 255 / 0.26)'
+    context.beginPath()
+    context.arc(centerX - beadRadius * 0.28, centerY - beadRadius * 0.32, Math.max(0.35, beadRadius * 0.18), 0, Math.PI * 2)
+    context.fill()
+
+    context.fillStyle = isDark ? 'rgb(18 16 14 / 0.42)' : 'rgb(255 255 255 / 0.7)'
+    context.beginPath()
+    context.arc(centerX, centerY, holeRadius, 0, Math.PI * 2)
+    context.fill()
+
+    context.strokeStyle = isDark ? 'rgb(0 0 0 / 0.28)' : 'rgb(25 23 21 / 0.12)'
+    context.lineWidth = Math.max(0.35, cellSize * 0.035)
+    context.beginPath()
+    context.arc(centerX, centerY, holeRadius, 0, Math.PI * 2)
+    context.stroke()
+  }
+}
+
 const drawPatternCanvas = (): void => {
   const canvas = patternCanvas.value
   const frame = patternCanvasFrame.value
@@ -721,6 +815,11 @@ const drawPatternCanvas = (): void => {
   context.fillStyle = isDark ? '#2a2723' : '#ffffff'
   drawRoundedRect(context, 0, 0, cssSize, cssSize, 8)
   context.fill()
+
+  if (isActualEffectPreview.value) {
+    drawActualEffectCanvas(context, metrics, cells, columns, isDark)
+    return
+  }
 
   if (showGridLabels.value) {
     context.fillStyle = isDark ? '#d8d2c7' : '#5f564b'
@@ -861,7 +960,7 @@ const onCanvasWheel = (event: WheelEvent): void => {
 const onCanvasPointerDown = (event: PointerEvent): void => {
   if (event.button !== 0) return
 
-  const isPanMode = isSpacePressed.value
+  const isPanMode = isSpacePressed.value || isActualEffectPreview.value
   if (patternCanvasStage.value && !patternCanvasStage.value.hasPointerCapture(event.pointerId)) {
     patternCanvasStage.value.setPointerCapture(event.pointerId)
   }
@@ -920,7 +1019,7 @@ const onCanvasPointerUp = (event: PointerEvent): void => {
     patternCanvasStage.value.releasePointerCapture(event.pointerId)
   }
 
-  if (pointerState.isPanMode || didDrag) return
+  if (pointerState.isPanMode || didDrag || isActualEffectPreview.value) return
 
   const index = getCanvasCellIndex(event)
   if (index === null) return
@@ -1112,6 +1211,7 @@ const applySavedProject = (project: SavedProject, displayName: string): void => 
   selectedModel.value = project.ai.modelId
   capabilitiesByModel.value = { ...(matchingProvider?.capabilitiesByModel ?? {}) }
   sourceFile.value = null
+  sourcePreviewDataUrl.value = ''
   aiReferenceDataUrl.value = ''
   aiReferenceName.value = ''
   aiOptimizeStatus.value = ''
@@ -1572,13 +1672,67 @@ const generatePatternFromSourceImage = async (): Promise<void> => {
   }
 }
 
+const onProcessedImageSelected = async (event: Event): Promise<void> => {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+
+  if (!file || isOptimizingImage.value || isGenerating.value) {
+    input.value = ''
+    return
+  }
+
+  const token = (generationToken += 1)
+  isGenerating.value = true
+  aiOptimizeError.value = ''
+  generationError.value = ''
+  aiOptimizeElapsedSeconds.value = 0
+  aiOptimizeStatus.value = '正在导入已优化图，未调用 AI'
+  generationMessage.value = '正在从已优化图生成图纸'
+
+  try {
+    const dataUrl = await readImageFileAsDataUrl(file)
+    const referenceName = `已优化图 · ${file.name}`
+    const nextPattern = await createPatternFromImageDataUrl(
+      dataUrl,
+      referenceName,
+      getPatternGenerationOptions()
+    )
+
+    if (token !== generationToken) return
+
+    aiReferenceDataUrl.value = dataUrl
+    aiReferenceName.value = referenceName
+    patternGrid.value = nextPattern
+    hasManualEdits.value = false
+    undoStack.value = []
+    redoStack.value = []
+    aiOptimizeStatus.value = '已导入已优化图并生成图纸，未调用 AI'
+    generationMessage.value = `已从 ${file.name} 生成图纸（未调用 AI）`
+  } catch (error) {
+    if (token !== generationToken) return
+
+    const message = error instanceof Error ? error.message : '已优化图导入失败'
+    aiOptimizeError.value = message
+    generationError.value = message
+    generationMessage.value = ''
+  } finally {
+    if (token === generationToken) {
+      isGenerating.value = false
+    }
+
+    input.value = ''
+  }
+}
+
 const onImageSelected = async (event: Event): Promise<void> => {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
 
   if (!file) return
 
+  const previewToken = (sourcePreviewToken += 1)
   sourceFile.value = file
+  sourcePreviewDataUrl.value = ''
   aiReferenceDataUrl.value = ''
   aiReferenceName.value = ''
   aiOptimizeStatus.value = ''
@@ -1587,6 +1741,18 @@ const onImageSelected = async (event: Event): Promise<void> => {
   generationError.value = ''
   generationMessage.value = `已选择 ${file.name}，点击${isAiOptimizeMode.value ? 'AI 优化原图' : '普通生成'}后生成图纸`
   input.value = ''
+
+  try {
+    const dataUrl = await readImageFileAsDataUrl(file)
+
+    if (previewToken !== sourcePreviewToken) return
+
+    sourcePreviewDataUrl.value = dataUrl
+  } catch (error) {
+    if (previewToken !== sourcePreviewToken) return
+
+    generationError.value = error instanceof Error ? error.message : '图片预览读取失败'
+  }
 }
 
 const onAiImageSelected = async (event: Event): Promise<void> => {
@@ -1781,7 +1947,7 @@ watch(aiCreationMode, () => {
   generationMessage.value = `已选择 ${sourceFile.value.name}，点击${isAiOptimizeMode.value ? 'AI 优化原图' : '普通生成'}后生成图纸`
 })
 
-watch([patternGrid, showGridLabels, resolvedTheme], () => {
+watch([patternGrid, showGridLabels, resolvedTheme, patternPreviewMode], () => {
   void nextTick(drawPatternCanvas)
 }, { deep: true })
 
@@ -2117,15 +2283,28 @@ onBeforeUnmount(() => {
                 :key="tool.id"
                 class="rounded-md p-2 transition"
                 :class="
-                  activeTool === tool.id
+                  !isActualEffectPreview && activeTool === tool.id
                     ? 'bg-ink-900 text-white dark:bg-ink-50 dark:text-ink-900'
                     : 'text-ink-600 hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10'
                 "
                 type="button"
                 :title="tool.label"
-                @click="activeTool = tool.id"
+                @click="patternPreviewMode = 'chart'; activeTool = tool.id"
               >
                 <Icon :icon="tool.icon" class="h-4 w-4" />
+              </button>
+              <button
+                class="rounded-md p-2 transition"
+                :class="
+                  isActualEffectPreview
+                    ? 'bg-ink-900 text-white dark:bg-ink-50 dark:text-ink-900'
+                    : 'text-ink-600 hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10'
+                "
+                type="button"
+                :title="isActualEffectPreview ? '返回编辑图纸' : '预览实际效果图'"
+                @click="patternPreviewMode = isActualEffectPreview ? 'chart' : 'effect'"
+              >
+                <Icon :icon="isActualEffectPreview ? 'ri:grid-line' : 'ri:eye-line'" class="h-4 w-4" />
               </button>
               <button
                 class="rounded-md p-2 text-ink-600 transition hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10"
@@ -2283,7 +2462,7 @@ onBeforeUnmount(() => {
             </div>
             <div>
               <span class="block text-xs text-ink-500 dark:text-ink-400">工具</span>
-              <strong>{{ editorTools.find((tool) => tool.id === activeTool)?.label }}</strong>
+              <strong>{{ activeToolLabel }}</strong>
             </div>
             <div>
               <span class="block text-xs text-ink-500 dark:text-ink-400">状态</span>
@@ -2343,16 +2522,43 @@ onBeforeUnmount(() => {
 
 
             <label
-              class="flex cursor-pointer flex-col items-center justify-center rounded-md border border-dashed border-ink-200 bg-ink-50 px-3 py-6 text-center transition hover:border-bead-sky hover:bg-bead-sky/5 dark:border-white/10 dark:bg-ink-900 dark:hover:bg-bead-sky/10"
+              class="group flex min-h-32 cursor-pointer flex-col justify-center rounded-md border border-dashed border-ink-200 bg-ink-50 p-3 text-center transition hover:border-bead-sky hover:bg-bead-sky/5 dark:border-white/10 dark:bg-ink-900 dark:hover:bg-bead-sky/10"
               title="上传 AI 参考图片"
             >
-              <Icon icon="ri:image-add-line" class="h-8 w-8 text-bead-sky" />
-              <span class="mt-2 text-sm font-semibold text-ink-800 dark:text-ink-100">
-                {{ sourceFile ? '更换图片' : '上传图片' }}
-              </span>
-              <span class="mt-1 block max-w-full truncate text-xs text-ink-500 dark:text-ink-400">
-                {{ sourceFile?.name || patternGrid.sourceName }}
-              </span>
+              <template v-if="sourcePreviewDataUrl">
+                <div class="flex w-full items-center gap-3 text-left">
+                  <div class="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded border border-ink-100 bg-white dark:border-white/10 dark:bg-ink-800">
+                    <img
+                      class="h-full w-full object-contain"
+                      :src="sourcePreviewDataUrl"
+                      :alt="sourceFile?.name || '原图预览'"
+                    />
+                  </div>
+                  <div class="min-w-0 flex-1">
+                    <span class="flex items-center gap-1.5 text-xs font-semibold text-ink-800 dark:text-ink-100">
+                      <Icon icon="ri:image-edit-line" class="h-3.5 w-3.5 text-bead-sky" />
+                      原图预览 · 点击更换
+                    </span>
+                    <span class="mt-1 block max-w-full truncate text-xs text-ink-500 dark:text-ink-400">
+                      {{ sourceFile?.name }}
+                    </span>
+                    <span class="mt-2 inline-flex items-center rounded bg-bead-sky/10 px-2 py-1 text-[11px] font-semibold text-bead-sky">
+                      缩略图
+                    </span>
+                  </div>
+                </div>
+              </template>
+              <template v-else>
+                <div class="flex min-h-28 flex-col items-center justify-center px-3 py-4">
+                  <Icon icon="ri:image-add-line" class="h-8 w-8 text-bead-sky" />
+                  <span class="mt-2 text-sm font-semibold text-ink-800 dark:text-ink-100">
+                    {{ sourceFile ? '更换图片' : '上传图片' }}
+                  </span>
+                  <span class="mt-1 block max-w-full truncate text-xs text-ink-500 dark:text-ink-400">
+                    {{ sourceFile?.name || patternGrid.sourceName }}
+                  </span>
+                </div>
+              </template>
               <input class="hidden" type="file" accept="image/*" @change="onAiImageSelected" />
             </label>
 
@@ -2419,17 +2625,34 @@ onBeforeUnmount(() => {
               <span>{{ isGenerating ? '生成中' : '普通生成' }}</span>
             </button>
 
-            <button
-              v-else
-              class="inline-flex w-full items-center justify-center gap-2 rounded-md bg-bead-coral px-3 py-2.5 text-sm font-semibold text-white transition hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-55"
-              type="button"
-              title="AI 优化原图"
-              :disabled="!sourceFile || isOptimizingImage || isGenerating"
-              @click="optimizeImageWithAi"
-            >
-              <Icon :icon="isOptimizingImage ? 'ri:loader-4-line' : 'ri:magic-line'" class="h-4 w-4" :class="isOptimizingImage ? 'animate-spin' : ''" />
-              <span>{{ isOptimizingImage ? 'AI 优化中' : 'AI 优化原图' }}</span>
-            </button>
+            <template v-else>
+              <button
+                class="inline-flex w-full items-center justify-center gap-2 rounded-md bg-bead-coral px-3 py-2.5 text-sm font-semibold text-white transition hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-55"
+                type="button"
+                title="AI 优化原图"
+                :disabled="!sourceFile || isOptimizingImage || isGenerating"
+                @click="optimizeImageWithAi"
+              >
+                <Icon :icon="isOptimizingImage ? 'ri:loader-4-line' : 'ri:magic-line'" class="h-4 w-4" :class="isOptimizingImage ? 'animate-spin' : ''" />
+                <span>{{ isOptimizingImage ? 'AI 优化中' : 'AI 优化原图' }}</span>
+              </button>
+
+              <label
+                class="inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-md border border-dashed border-bead-sky/40 bg-bead-sky/10 px-3 py-2.5 text-sm font-semibold text-bead-sky transition hover:bg-bead-sky/15 has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-55 dark:border-bead-sky/30 dark:bg-bead-sky/15"
+                title="临时入口：上传已优化图并直接生成图纸，不调用 AI"
+              >
+                <Icon icon="ri:image-add-line" class="h-4 w-4" />
+                <span>{{ isGenerating ? '导入中' : '上传已优化图' }}</span>
+                <span class="rounded bg-white/70 px-1.5 py-0.5 text-[11px] dark:bg-ink-900/60">不调用 AI</span>
+                <input
+                  class="hidden"
+                  type="file"
+                  accept="image/*"
+                  :disabled="isOptimizingImage || isGenerating"
+                  @change="onProcessedImageSelected"
+                />
+              </label>
+            </template>
 
             <div
               v-if="isAiOptimizeMode"
