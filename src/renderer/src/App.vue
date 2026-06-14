@@ -1477,11 +1477,6 @@ const optimizeImageWithAi = async (): Promise<void> => {
       boardRows: requestBoardRows,
       manufacturerName: activeManufacturerPalette.value.name,
       maxColors: maxColors.value,
-      paletteColors: activePaletteColors.value.map((color) => ({
-        id: color.id,
-        name: color.name,
-        hex: color.hex
-      })),
       imageDataUrl,
       imageName: imageFile.name
     }

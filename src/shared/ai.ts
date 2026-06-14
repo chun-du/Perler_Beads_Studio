@@ -12,11 +12,6 @@ export interface AiImageOptimizationRequest extends AiProviderConnection {
   boardRows: number
   manufacturerName: string
   maxColors: number
-  paletteColors: Array<{
-    id: string
-    name: string
-    hex: string
-  }>
   imageDataUrl: string
   imageName?: string
 }
@@ -115,20 +110,15 @@ export const createAiImageOptimizationPrompt = (request: {
   boardRows: number
   manufacturerName: string
   maxColors: number
-  paletteColors: Array<{ id: string; name: string; hex: string }>
 }): string => {
-  const paletteSummary = request.paletteColors
-    .map((color) => `${color.id} ${color.name} ${color.hex}`)
-    .join('; ')
   const basePrompt = [
     'Use the uploaded reference image as the primary source. Do not invent a different subject, pose, or composition.',
     'Create a clean pixel-art reference image for converting into a deterministic Perler bead pattern.',
     `The output image will be converted into a ${request.boardColumns} x ${request.boardRows} bead grid. Build the image as if the whole canvas is strictly divided into ${request.boardColumns} columns and ${request.boardRows} rows.`,
     'Every grid cell should read as one complete filled color block. Avoid gradients, sub-cell details, antialiasing blur, partial-cell strokes, soft shadows, and tiny texture that cannot occupy a full grid cell.',
     'The subject does not need to be perfectly centered if moving or scaling it helps each cell stay fully filled and readable.',
-    `Use colors as close as possible to the ${request.manufacturerName} manufacturer bead palette. Prefer only palette colors or close equivalents.`,
+    `Use colors as close as possible to the ${request.manufacturerName} manufacturer bead palette. Refer to the manufacturer palette list on Bitbead: https://bitbead.pomodiary.com/en/colors . Prefer colors from that palette or close equivalents.`,
     `Limit the final image to no more than ${request.maxColors} distinct colors.`,
-    `Available palette colors: ${paletteSummary}.`,
     'Preserve the main subject and recognizable silhouette while simplifying tiny details and reducing visual noise.',
     'Prefer a clean background or transparent-looking separation when it helps the subject read clearly.',
     'Do not add text, watermarks, borders, or new unrelated objects.',

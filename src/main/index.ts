@@ -122,15 +122,6 @@ const isAiImageOptimizationRequest = (value: unknown): value is AiImageOptimizat
     typeof value.boardRows === 'number' &&
     typeof value.manufacturerName === 'string' &&
     typeof value.maxColors === 'number' &&
-    Array.isArray(value.paletteColors) &&
-    value.paletteColors.every((color) => {
-      return (
-        isRecord(color) &&
-        typeof color.id === 'string' &&
-        typeof color.name === 'string' &&
-        typeof color.hex === 'string'
-      )
-    }) &&
     typeof value.imageDataUrl === 'string' &&
     (value.prompt === undefined || typeof value.prompt === 'string') &&
     (value.imageName === undefined || typeof value.imageName === 'string')
