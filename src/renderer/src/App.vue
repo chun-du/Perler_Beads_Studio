@@ -70,7 +70,7 @@ interface BrowserStoredAiProviderProfilesStorage {
 const { preference, resolvedTheme, setPreference, cycleTheme } = useTheme()
 
 const boardSizes = ['32 x 32', '48 x 48', '64 x 64', '96 x 96']
-const defaultAiOptimizationMode = '拼豆图纸优化'
+const defaultAiOptimizationMode = '强制像素画风拼豆图纸优化'
 const browserAiProviderProfilesStorageKey = 'perler.aiProviderProfiles.v1'
 const aiModelCapabilities = ['image-generation', 'image-editing', 'vision', 'text'] satisfies AiModelCapability[]
 const aiCreationModes: Array<{ id: AiCreationMode; label: string; description: string }> = [
@@ -2797,7 +2797,7 @@ onBeforeUnmount(() => {
               <textarea
                 v-model="aiPrompt"
                 class="min-h-32 w-full resize-y rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
-                placeholder="例如：保留主体轮廓，简化背景，把颜色压成清晰的大色块"
+                placeholder="例如：保持硬边像素画风，保留主体轮廓，简化背景，把颜色压成清晰的大色块"
               ></textarea>
             </label>
 
