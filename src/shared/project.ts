@@ -7,6 +7,11 @@ export interface SavedProject {
     boardSize: string
     maxColors: number
     inputMode: 'image' | 'pixel-art'
+    pixelArtCalibration?: {
+      scale: number
+      offsetX: number
+      offsetY: number
+    }
     dithering: boolean
     cleanup: boolean
     showLabels: boolean

@@ -7,6 +7,12 @@ export interface PatternGrid {
   sourceName: string
 }
 
+export interface PixelArtCalibration {
+  scale: number
+  offsetX: number
+  offsetY: number
+}
+
 export interface PatternGenerationOptions {
   boardSize: string
   maxColors: number
@@ -14,6 +20,7 @@ export interface PatternGenerationOptions {
   cleanup: boolean
   inputMode: 'image' | 'pixel-art'
   palette: BeadColor[]
+  pixelArtCalibration?: PixelArtCalibration
 }
 
 export interface PatternExportOptions {
@@ -53,9 +60,43 @@ interface LabColor {
   b: number
 }
 
+interface CropRect {
+  sx: number
+  sy: number
+  sw: number
+  sh: number
+}
+
+interface SimpleRgbColor {
+  r: number
+  g: number
+  b: number
+}
+
+interface PixelArtBlankInfo {
+  backgroundColor?: SimpleRgbColor
+  blankMask?: Uint8Array
+}
+
+interface PixelArtFit {
+  source: CropRect
+  targetX: number
+  targetY: number
+  targetColumns: number
+  targetRows: number
+  blankInfo: PixelArtBlankInfo
+}
+
+interface PixelArtColorVote {
+  color: SimpleRgbColor
+  weight: number
+}
+
 const transparentAlphaThreshold = 16
 const degreesToRadians = Math.PI / 180
 const radiansToDegrees = 180 / Math.PI
+const blankBackgroundTolerance = 6
+const pixelArtMinimumCoverageRatio = 0.08
 
 const isTransparentAlpha = (alpha: number): boolean => {
   return alpha <= transparentAlphaThreshold
@@ -205,13 +246,70 @@ export const parseBoardSize = (boardSize: string): { columns: number; rows: numb
   return { columns, rows }
 }
 
-const getNearestColor = (r: number, g: number, b: number, palette: RgbColor[]): RgbColor => {
+const getRgbKey = (r: number, g: number, b: number): string => {
+  return `${Math.round(clampRgbChannel(r))},${Math.round(clampRgbChannel(g))},${Math.round(clampRgbChannel(b))}`
+}
+
+const getRgbDistance = (
+  r: number,
+  g: number,
+  b: number,
+  color: Pick<RgbColor, 'r' | 'g' | 'b'>
+): number => {
+  const redDelta = r - color.r
+  const greenDelta = g - color.g
+  const blueDelta = b - color.b
+
+  return Math.sqrt(redDelta * redDelta + greenDelta * greenDelta + blueDelta * blueDelta)
+}
+
+const createExactPaletteLookup = (palette: RgbColor[]): Map<string, RgbColor> => {
+  const lookup = new Map<string, RgbColor>()
+
+  for (const color of palette) {
+    const key = getRgbKey(color.r, color.g, color.b)
+    if (!lookup.has(key)) {
+      lookup.set(key, color)
+    }
+  }
+
+  return lookup
+}
+
+const getExactPaletteColor = (
+  r: number,
+  g: number,
+  b: number,
+  exactPaletteLookup?: Map<string, RgbColor>
+): RgbColor | undefined => {
+  if (!exactPaletteLookup || !Number.isInteger(r) || !Number.isInteger(g) || !Number.isInteger(b)) {
+    return undefined
+  }
+
+  return exactPaletteLookup.get(getRgbKey(r, g, b))
+}
+
+const getNearestColor = (
+  r: number,
+  g: number,
+  b: number,
+  palette: RgbColor[],
+  exactPaletteLookup?: Map<string, RgbColor>,
+  matchingMode: 'perceptual' | 'pixel-art' = 'perceptual'
+): RgbColor => {
+  const exactColor = getExactPaletteColor(r, g, b, exactPaletteLookup)
+  if (exactColor) return exactColor
+
   let nearestColor = palette[0]
   let nearestDistance = Number.POSITIVE_INFINITY
   const lab = rgbToLab(r, g, b)
 
   for (const color of palette) {
-    const distance = getCiede2000Difference(lab, color.lab)
+    const perceptualDistance = getCiede2000Difference(lab, color.lab)
+    const distance =
+      matchingMode === 'pixel-art'
+        ? perceptualDistance * 0.82 + getRgbDistance(r, g, b, color) * 0.045
+        : perceptualDistance
 
     if (distance < nearestDistance) {
       nearestDistance = distance
@@ -253,13 +351,14 @@ const selectPaletteForImage = (imageData: ImageData, palette: RgbColor[], maxCol
     return palette
   }
 
+  const exactPaletteLookup = createExactPaletteLookup(palette)
   const counts = new Map<string, { color: RgbColor; count: number }>()
 
   for (let index = 0; index < imageData.data.length; index += 4) {
     if (isTransparentAlpha(imageData.data[index + 3])) continue
 
     const pixel = getCompositedRgb(imageData.data, index)
-    const nearestColor = getNearestColor(pixel.r, pixel.g, pixel.b, palette)
+    const nearestColor = getNearestColor(pixel.r, pixel.g, pixel.b, palette, exactPaletteLookup)
     const current = counts.get(nearestColor.hex)
 
     if (current) {
@@ -285,6 +384,502 @@ const loadImage = async (source: string): Promise<HTMLImageElement> => {
     image.onerror = () => reject(new Error('图片读取失败'))
     image.src = source
   })
+}
+
+const getCenteredCrop = (sourceWidth: number, sourceHeight: number, targetColumns: number, targetRows: number): CropRect => {
+  const sourceRatio = sourceWidth / sourceHeight
+  const targetRatio = targetColumns / targetRows
+  let sx = 0
+  let sy = 0
+  let sw = sourceWidth
+  let sh = sourceHeight
+
+  if (sourceRatio > targetRatio) {
+    sw = sourceHeight * targetRatio
+    sx = (sourceWidth - sw) / 2
+  } else {
+    sh = sourceWidth / targetRatio
+    sy = (sourceHeight - sh) / 2
+  }
+
+  return { sx, sy, sw, sh }
+}
+
+const getPixelRgb = (imageData: ImageData, x: number, y: number): SimpleRgbColor => {
+  const index = (y * imageData.width + x) * 4
+
+  return {
+    r: imageData.data[index],
+    g: imageData.data[index + 1],
+    b: imageData.data[index + 2]
+  }
+}
+
+const isSimilarRgb = (left: SimpleRgbColor, right: SimpleRgbColor, tolerance: number): boolean => {
+  return (
+    Math.abs(left.r - right.r) <= tolerance &&
+    Math.abs(left.g - right.g) <= tolerance &&
+    Math.abs(left.b - right.b) <= tolerance
+  )
+}
+
+const getCornerBackgroundColor = (imageData: ImageData): SimpleRgbColor | undefined => {
+  const corners = [
+    { x: 0, y: 0 },
+    { x: imageData.width - 1, y: 0 },
+    { x: 0, y: imageData.height - 1 },
+    { x: imageData.width - 1, y: imageData.height - 1 }
+  ]
+  const opaqueCorners = corners.filter(({ x, y }) => {
+    const index = (y * imageData.width + x) * 4
+    return !isTransparentAlpha(imageData.data[index + 3])
+  })
+
+  if (opaqueCorners.length < 2) return undefined
+
+  const cornerColors = opaqueCorners.map(({ x, y }) => getPixelRgb(imageData, x, y))
+  const groups: Array<{ color: SimpleRgbColor; count: number }> = []
+
+  for (const color of cornerColors) {
+    const matchingGroup = groups.find((group) => isSimilarRgb(group.color, color, blankBackgroundTolerance))
+
+    if (matchingGroup) {
+      matchingGroup.count += 1
+    } else {
+      groups.push({ color, count: 1 })
+    }
+  }
+
+  const dominant = groups.sort((left, right) => right.count - left.count)[0]
+
+  if (!dominant || dominant.count <= opaqueCorners.length / 2) return undefined
+
+  return dominant.color
+}
+
+const isPixelArtBackgroundCandidate = (
+  imageData: ImageData,
+  x: number,
+  y: number,
+  backgroundColor: SimpleRgbColor | undefined
+): boolean => {
+  const index = (y * imageData.width + x) * 4
+
+  if (isTransparentAlpha(imageData.data[index + 3])) return true
+  if (!backgroundColor) return false
+
+  return isSimilarRgb(getPixelRgb(imageData, x, y), backgroundColor, blankBackgroundTolerance)
+}
+
+const createEdgeConnectedBlankMask = (
+  imageData: ImageData,
+  backgroundColor: SimpleRgbColor | undefined
+): Uint8Array => {
+  const mask = new Uint8Array(imageData.width * imageData.height)
+  const stack: number[] = []
+  const tryPush = (x: number, y: number): void => {
+    if (x < 0 || x >= imageData.width || y < 0 || y >= imageData.height) return
+
+    const index = y * imageData.width + x
+    if (mask[index] || !isPixelArtBackgroundCandidate(imageData, x, y, backgroundColor)) return
+
+    mask[index] = 1
+    stack.push(index)
+  }
+
+  for (let x = 0; x < imageData.width; x += 1) {
+    tryPush(x, 0)
+    tryPush(x, imageData.height - 1)
+  }
+
+  for (let y = 1; y < imageData.height - 1; y += 1) {
+    tryPush(0, y)
+    tryPush(imageData.width - 1, y)
+  }
+
+  while (stack.length > 0) {
+    const index = stack.pop() as number
+    const x = index % imageData.width
+    const y = Math.floor(index / imageData.width)
+
+    tryPush(x + 1, y)
+    tryPush(x - 1, y)
+    tryPush(x, y + 1)
+    tryPush(x, y - 1)
+  }
+
+  return mask
+}
+
+const isPixelArtBlankSourcePixel = (imageData: ImageData, x: number, y: number, blankInfo: PixelArtBlankInfo): boolean => {
+  if (!blankInfo.blankMask) return isPixelArtBackgroundCandidate(imageData, x, y, blankInfo.backgroundColor)
+
+  return blankInfo.blankMask[y * imageData.width + x] === 1
+}
+
+const getPixelArtContentRect = (imageData: ImageData, blankInfo: PixelArtBlankInfo): CropRect => {
+  let minX = imageData.width
+  let minY = imageData.height
+  let maxX = -1
+  let maxY = -1
+
+  for (let y = 0; y < imageData.height; y += 1) {
+    for (let x = 0; x < imageData.width; x += 1) {
+      if (isPixelArtBlankSourcePixel(imageData, x, y, blankInfo)) continue
+
+      minX = Math.min(minX, x)
+      minY = Math.min(minY, y)
+      maxX = Math.max(maxX, x)
+      maxY = Math.max(maxY, y)
+    }
+  }
+
+  if (maxX < minX || maxY < minY) {
+    return { sx: 0, sy: 0, sw: imageData.width, sh: imageData.height }
+  }
+
+  return {
+    sx: minX,
+    sy: minY,
+    sw: maxX - minX + 1,
+    sh: maxY - minY + 1
+  }
+}
+
+const getPixelArtFit = (sourceImageData: ImageData, columns: number, rows: number): PixelArtFit => {
+  const backgroundColor = getCornerBackgroundColor(sourceImageData)
+  const blankInfo: PixelArtBlankInfo = {
+    backgroundColor,
+    blankMask: createEdgeConnectedBlankMask(sourceImageData, backgroundColor)
+  }
+  const contentRect = getPixelArtContentRect(sourceImageData, blankInfo)
+  const sourceRatio = contentRect.sw / contentRect.sh
+  const targetRatio = columns / rows
+  let targetColumns = columns
+  let targetRows = rows
+
+  if (sourceRatio > targetRatio) {
+    targetRows = Math.max(1, Math.round(columns / sourceRatio))
+  } else {
+    targetColumns = Math.max(1, Math.round(rows * sourceRatio))
+  }
+
+  return {
+    source: contentRect,
+    targetX: Math.floor((columns - targetColumns) / 2),
+    targetY: Math.floor((rows - targetRows) / 2),
+    targetColumns,
+    targetRows,
+    blankInfo
+  }
+}
+
+const getSourceImageData = (image: HTMLImageElement): ImageData => {
+  const sampleCanvas = document.createElement('canvas')
+  const sampleContext = sampleCanvas.getContext('2d', { willReadFrequently: true })
+
+  if (!sampleContext) {
+    throw new Error('当前环境不支持 Canvas')
+  }
+
+  sampleCanvas.width = image.width
+  sampleCanvas.height = image.height
+  sampleContext.imageSmoothingEnabled = false
+  sampleContext.drawImage(image, 0, 0)
+
+  return sampleContext.getImageData(0, 0, image.width, image.height)
+}
+
+const getPixelArtSourceRectForCell = (
+  fit: PixelArtFit,
+  x: number,
+  y: number,
+  calibration?: PixelArtCalibration
+): CropRect | null => {
+  if (calibration) {
+    const scale = Math.max(0.01, calibration.scale)
+
+    return {
+      sx: (x - calibration.offsetX) / scale,
+      sy: (y - calibration.offsetY) / scale,
+      sw: 1 / scale,
+      sh: 1 / scale
+    }
+  }
+
+  const targetStartX = Math.max(x, fit.targetX)
+  const targetStartY = Math.max(y, fit.targetY)
+  const targetEndX = Math.min(x + 1, fit.targetX + fit.targetColumns)
+  const targetEndY = Math.min(y + 1, fit.targetY + fit.targetRows)
+
+  if (targetEndX <= targetStartX || targetEndY <= targetStartY) return null
+
+  const sx = fit.source.sx + ((targetStartX - fit.targetX) / fit.targetColumns) * fit.source.sw
+  const sy = fit.source.sy + ((targetStartY - fit.targetY) / fit.targetRows) * fit.source.sh
+  const sourceEndX = fit.source.sx + ((targetEndX - fit.targetX) / fit.targetColumns) * fit.source.sw
+  const sourceEndY = fit.source.sy + ((targetEndY - fit.targetY) / fit.targetRows) * fit.source.sh
+
+  return {
+    sx,
+    sy,
+    sw: sourceEndX - sx,
+    sh: sourceEndY - sy
+  }
+}
+
+const getPixelArtDominantColor = (
+  sourceImageData: ImageData,
+  sourceRect: CropRect,
+  blankInfo: PixelArtBlankInfo
+): SimpleRgbColor | null => {
+  if (sourceRect.sw <= 0 || sourceRect.sh <= 0) return null
+
+  const sourceWidth = sourceImageData.width
+  const sourceHeight = sourceImageData.height
+  const pixelStartX = Math.max(0, Math.floor(sourceRect.sx))
+  const pixelStartY = Math.max(0, Math.floor(sourceRect.sy))
+  const pixelEndX = Math.min(sourceWidth, Math.ceil(sourceRect.sx + sourceRect.sw))
+  const pixelEndY = Math.min(sourceHeight, Math.ceil(sourceRect.sy + sourceRect.sh))
+  const votes = new Map<string, PixelArtColorVote>()
+  const foregroundVotes = new Map<string, PixelArtColorVote>()
+  let visibleWeight = 0
+  let foregroundWeight = 0
+
+  for (let sourceY = pixelStartY; sourceY < pixelEndY; sourceY += 1) {
+    const yWeight = Math.max(
+      0,
+      Math.min(sourceRect.sy + sourceRect.sh, sourceY + 1) - Math.max(sourceRect.sy, sourceY)
+    )
+    if (yWeight <= 0) continue
+
+    for (let sourceX = pixelStartX; sourceX < pixelEndX; sourceX += 1) {
+      const xWeight = Math.max(
+        0,
+        Math.min(sourceRect.sx + sourceRect.sw, sourceX + 1) - Math.max(sourceRect.sx, sourceX)
+      )
+      const overlapWeight = xWeight * yWeight
+      if (overlapWeight <= 0) continue
+
+      const sourceIndex = (sourceY * sourceWidth + sourceX) * 4
+      const alpha = sourceImageData.data[sourceIndex + 3]
+      if (isTransparentAlpha(alpha)) continue
+
+      const pixel = getCompositedRgb(sourceImageData.data, sourceIndex)
+      const key = getRgbKey(pixel.r, pixel.g, pixel.b)
+      const voteWeight = overlapWeight * (alpha / 255)
+      const current = votes.get(key)
+      const isBackground = blankInfo.backgroundColor
+        ? isSimilarRgb(
+            {
+              r: Math.round(clampRgbChannel(pixel.r)),
+              g: Math.round(clampRgbChannel(pixel.g)),
+              b: Math.round(clampRgbChannel(pixel.b))
+            },
+            blankInfo.backgroundColor,
+            blankBackgroundTolerance
+          )
+        : false
+
+      visibleWeight += voteWeight
+
+      if (current) {
+        current.weight += voteWeight
+      } else {
+        votes.set(key, {
+          color: {
+            r: Math.round(clampRgbChannel(pixel.r)),
+            g: Math.round(clampRgbChannel(pixel.g)),
+            b: Math.round(clampRgbChannel(pixel.b))
+          },
+          weight: voteWeight
+        })
+      }
+
+      if (!isBackground) {
+        const foregroundCurrent = foregroundVotes.get(key)
+        foregroundWeight += voteWeight
+
+        if (foregroundCurrent) {
+          foregroundCurrent.weight += voteWeight
+        } else {
+          foregroundVotes.set(key, {
+            color: {
+              r: Math.round(clampRgbChannel(pixel.r)),
+              g: Math.round(clampRgbChannel(pixel.g)),
+              b: Math.round(clampRgbChannel(pixel.b))
+            },
+            weight: voteWeight
+          })
+        }
+      }
+    }
+  }
+
+  if (visibleWeight < sourceRect.sw * sourceRect.sh * pixelArtMinimumCoverageRatio) return null
+
+  const votePool = foregroundWeight >= visibleWeight * 0.16 ? foregroundVotes : votes
+  const dominant = [...votePool.values()].sort((left, right) => right.weight - left.weight)[0]
+  return dominant?.color ?? null
+}
+
+const samplePixelArtImageData = (
+  sourceImageData: ImageData,
+  fit: PixelArtFit,
+  columns: number,
+  rows: number,
+  context: CanvasRenderingContext2D,
+  calibration?: PixelArtCalibration
+): ImageData => {
+  const targetImageData = context.createImageData(columns, rows)
+
+  for (let y = 0; y < rows; y += 1) {
+    for (let x = 0; x < columns; x += 1) {
+      const targetIndex = (y * columns + x) * 4
+      const sourceRect = getPixelArtSourceRectForCell(fit, x, y, calibration)
+
+      if (!sourceRect) {
+        targetImageData.data[targetIndex + 3] = 0
+        continue
+      }
+
+      const dominantColor = getPixelArtDominantColor(sourceImageData, sourceRect, fit.blankInfo)
+
+      if (!dominantColor) {
+        targetImageData.data[targetIndex + 3] = 0
+        continue
+      }
+
+      targetImageData.data[targetIndex] = dominantColor.r
+      targetImageData.data[targetIndex + 1] = dominantColor.g
+      targetImageData.data[targetIndex + 2] = dominantColor.b
+      targetImageData.data[targetIndex + 3] = 255
+    }
+  }
+
+  clearEdgeConnectedPixelArtBackground(targetImageData, fit.blankInfo.backgroundColor)
+
+  return targetImageData
+}
+
+const clearEdgeConnectedPixelArtBackground = (imageData: ImageData, backgroundColor: SimpleRgbColor | undefined): void => {
+  if (!backgroundColor) return
+
+  const mask = new Uint8Array(imageData.width * imageData.height)
+  const stack: number[] = []
+  const tryPush = (x: number, y: number): void => {
+    if (x < 0 || x >= imageData.width || y < 0 || y >= imageData.height) return
+
+    const index = y * imageData.width + x
+    const dataIndex = index * 4
+    if (mask[index] || isTransparentAlpha(imageData.data[dataIndex + 3])) return
+
+    const color = {
+      r: imageData.data[dataIndex],
+      g: imageData.data[dataIndex + 1],
+      b: imageData.data[dataIndex + 2]
+    }
+
+    if (!isSimilarRgb(color, backgroundColor, blankBackgroundTolerance)) return
+
+    mask[index] = 1
+    stack.push(index)
+  }
+
+  for (let x = 0; x < imageData.width; x += 1) {
+    tryPush(x, 0)
+    tryPush(x, imageData.height - 1)
+  }
+
+  for (let y = 1; y < imageData.height - 1; y += 1) {
+    tryPush(0, y)
+    tryPush(imageData.width - 1, y)
+  }
+
+  while (stack.length > 0) {
+    const index = stack.pop() as number
+    const x = index % imageData.width
+    const y = Math.floor(index / imageData.width)
+    const dataIndex = index * 4
+
+    imageData.data[dataIndex + 3] = 0
+    tryPush(x + 1, y)
+    tryPush(x - 1, y)
+    tryPush(x, y + 1)
+    tryPush(x, y - 1)
+  }
+}
+
+const averageImageDataToBoard = (
+  sourceImageData: ImageData,
+  crop: CropRect,
+  columns: number,
+  rows: number,
+  context: CanvasRenderingContext2D
+): ImageData => {
+  const targetImageData = context.createImageData(columns, rows)
+  const sourceWidth = sourceImageData.width
+  const sourceHeight = sourceImageData.height
+
+  for (let y = 0; y < rows; y += 1) {
+    const cellStartY = crop.sy + (y / rows) * crop.sh
+    const cellEndY = crop.sy + ((y + 1) / rows) * crop.sh
+    const pixelStartY = Math.max(0, Math.floor(cellStartY))
+    const pixelEndY = Math.min(sourceHeight, Math.ceil(cellEndY))
+
+    for (let x = 0; x < columns; x += 1) {
+      const cellStartX = crop.sx + (x / columns) * crop.sw
+      const cellEndX = crop.sx + ((x + 1) / columns) * crop.sw
+      const pixelStartX = Math.max(0, Math.floor(cellStartX))
+      const pixelEndX = Math.min(sourceWidth, Math.ceil(cellEndX))
+      let totalWeight = 0
+      let alphaWeight = 0
+      let redSum = 0
+      let greenSum = 0
+      let blueSum = 0
+
+      for (let sourceY = pixelStartY; sourceY < pixelEndY; sourceY += 1) {
+        const yWeight = Math.max(0, Math.min(cellEndY, sourceY + 1) - Math.max(cellStartY, sourceY))
+        if (yWeight <= 0) continue
+
+        for (let sourceX = pixelStartX; sourceX < pixelEndX; sourceX += 1) {
+          const xWeight = Math.max(0, Math.min(cellEndX, sourceX + 1) - Math.max(cellStartX, sourceX))
+          const weight = xWeight * yWeight
+          if (weight <= 0) continue
+
+          const sourceIndex = (sourceY * sourceWidth + sourceX) * 4
+          const alpha = sourceImageData.data[sourceIndex + 3] / 255
+          const weightedAlpha = alpha * weight
+
+          totalWeight += weight
+          alphaWeight += weightedAlpha
+          redSum += sourceImageData.data[sourceIndex] * weightedAlpha
+          greenSum += sourceImageData.data[sourceIndex + 1] * weightedAlpha
+          blueSum += sourceImageData.data[sourceIndex + 2] * weightedAlpha
+        }
+      }
+
+      const targetIndex = (y * columns + x) * 4
+
+      if (totalWeight <= 0 || alphaWeight <= 0) {
+        targetImageData.data[targetIndex + 3] = 0
+        continue
+      }
+
+      const averageAlpha = (alphaWeight / totalWeight) * 255
+
+      if (isTransparentAlpha(averageAlpha)) {
+        targetImageData.data[targetIndex + 3] = 0
+        continue
+      }
+
+      targetImageData.data[targetIndex] = redSum / alphaWeight
+      targetImageData.data[targetIndex + 1] = greenSum / alphaWeight
+      targetImageData.data[targetIndex + 2] = blueSum / alphaWeight
+      targetImageData.data[targetIndex + 3] = averageAlpha
+    }
+  }
+
+  return targetImageData
 }
 
 export const readImageFileAsDataUrl = async (file: File): Promise<string> => {
@@ -514,59 +1109,28 @@ export const createPatternFromImageDataUrl = async (
   canvas.height = rows
   context.imageSmoothingEnabled = options.inputMode !== 'pixel-art'
 
-  const sourceRatio = image.width / image.height
-  const targetRatio = columns / rows
-  let sx = 0
-  let sy = 0
-  let sw = image.width
-  let sh = image.height
-
-  if (sourceRatio > targetRatio) {
-    sw = image.height * targetRatio
-    sx = (image.width - sw) / 2
-  } else {
-    sh = image.width / targetRatio
-    sy = (image.height - sh) / 2
-  }
-
-  if (options.inputMode === 'pixel-art') {
-    const sampleCanvas = document.createElement('canvas')
-    const sampleContext = sampleCanvas.getContext('2d', { willReadFrequently: true })
-
-    if (!sampleContext) {
-      throw new Error('当前环境不支持 Canvas')
-    }
-
-    sampleCanvas.width = image.width
-    sampleCanvas.height = image.height
-    sampleContext.imageSmoothingEnabled = false
-    sampleContext.drawImage(image, 0, 0)
-
-    const sampleData = sampleContext.getImageData(0, 0, image.width, image.height)
-    const targetImageData = context.createImageData(columns, rows)
-
-    for (let y = 0; y < rows; y += 1) {
-      for (let x = 0; x < columns; x += 1) {
-        const sourceX = Math.min(image.width - 1, Math.max(0, Math.floor(sx + ((x + 0.5) / columns) * sw)))
-        const sourceY = Math.min(image.height - 1, Math.max(0, Math.floor(sy + ((y + 0.5) / rows) * sh)))
-        const sourceIndex = (sourceY * image.width + sourceX) * 4
-        const targetIndex = (y * columns + x) * 4
-
-        targetImageData.data[targetIndex] = sampleData.data[sourceIndex]
-        targetImageData.data[targetIndex + 1] = sampleData.data[sourceIndex + 1]
-        targetImageData.data[targetIndex + 2] = sampleData.data[sourceIndex + 2]
-        targetImageData.data[targetIndex + 3] = sampleData.data[sourceIndex + 3]
-      }
-    }
-
-    context.putImageData(targetImageData, 0, 0)
-  } else {
-    context.drawImage(image, sx, sy, sw, sh, 0, 0, columns, rows)
-  }
-
-  const imageData = context.getImageData(0, 0, columns, rows)
+  const sourceImageData = getSourceImageData(image)
+  const imageData =
+    options.inputMode === 'pixel-art'
+      ? samplePixelArtImageData(
+          sourceImageData,
+          getPixelArtFit(sourceImageData, columns, rows),
+          columns,
+          rows,
+          context,
+          options.pixelArtCalibration
+        )
+      : averageImageDataToBoard(
+          sourceImageData,
+          getCenteredCrop(image.width, image.height, columns, rows),
+          columns,
+          rows,
+          context
+        )
   const rgbPalette = options.palette.map((color) => parseHex(color.hex))
-  const activePalette = selectPaletteForImage(imageData, rgbPalette, options.maxColors)
+  const activePalette =
+    options.inputMode === 'pixel-art' ? rgbPalette : selectPaletteForImage(imageData, rgbPalette, options.maxColors)
+  const exactPaletteLookup = createExactPaletteLookup(activePalette)
   const cells: string[] = new Array(columns * rows)
 
   if (options.dithering && options.inputMode !== 'pixel-art') {
@@ -590,7 +1154,13 @@ export const createPatternFromImageDataUrl = async (
           continue
         }
 
-        const nearestColor = getNearestColor(data[index], data[index + 1], data[index + 2], activePalette)
+        const nearestColor = getNearestColor(
+          data[index],
+          data[index + 1],
+          data[index + 2],
+          activePalette,
+          exactPaletteLookup
+        )
         const error = {
           r: data[index] - nearestColor.r,
           g: data[index + 1] - nearestColor.g,
@@ -612,7 +1182,14 @@ export const createPatternFromImageDataUrl = async (
       }
 
       const pixel = getCompositedRgb(imageData.data, index)
-      const nearestColor = getNearestColor(pixel.r, pixel.g, pixel.b, activePalette)
+      const nearestColor = getNearestColor(
+        pixel.r,
+        pixel.g,
+        pixel.b,
+        activePalette,
+        exactPaletteLookup,
+        options.inputMode === 'pixel-art' ? 'pixel-art' : 'perceptual'
+      )
       cells[index / 4] = nearestColor.hex
     }
   }
