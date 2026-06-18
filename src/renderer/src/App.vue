@@ -11,6 +11,19 @@ import type {
 import { buildAiImageEditsUrl, buildAiModelsUrl, createAiImageOptimizationPrompt } from '@shared/ai'
 import type { SavedProject } from '@shared/project'
 import type { ThemePreference } from '@shared/theme'
+import AiCreationModeSelector from './components/AiCreationModeSelector.vue'
+import AiOptimizeResultPanel from './components/AiOptimizeResultPanel.vue'
+import AiProviderSettingsModal from './components/AiProviderSettingsModal.vue'
+import AppHeader from './components/AppHeader.vue'
+import BeadInventoryPanel from './components/BeadInventoryPanel.vue'
+import CurrentColorBar from './components/CurrentColorBar.vue'
+import GenerationSourcePanel from './components/GenerationSourcePanel.vue'
+import PatternPreviewStatusBar from './components/PatternPreviewStatusBar.vue'
+import PixelArtCalibrationModal from './components/PixelArtCalibrationModal.vue'
+import PatternPreviewToolbar from './components/PatternPreviewToolbar.vue'
+import PatternSettingsPanel from './components/PatternSettingsPanel.vue'
+import ShortcutHelpPopover from './components/ShortcutHelpPopover.vue'
+import { usePatternEditor } from './composables/usePatternEditor'
 import { useTheme } from './composables/useTheme'
 import {
   defaultManufacturerId,
@@ -30,7 +43,7 @@ import {
   printPatternSheet,
   readImageFileAsDataUrl
 } from './utils/pattern'
-import type { PatternGrid } from './utils/pattern'
+import type { PatternGrid, PixelArtCalibration } from './utils/pattern'
 
 type EditorTool = 'pencil' | 'fill' | 'eyedropper' | 'eraser'
 type PatternInputMode = 'image' | 'pixel-art'
@@ -41,10 +54,27 @@ interface CanvasPointerState {
   pointerId: number
   button: number
   isPanMode: boolean
+  isPaintMode: boolean
   startClientX: number
   startClientY: number
   startPanX: number
   startPanY: number
+}
+
+interface CanvasPaintSession {
+  cells: string[]
+  hasChanges: boolean
+  lastIndex: number | null
+  nextColor: string
+  pushedHistory: boolean
+}
+
+interface PixelArtCalibrationPointerState {
+  pointerId: number
+  startClientX: number
+  startClientY: number
+  startOffsetX: number
+  startOffsetY: number
 }
 
 interface AiProviderOption {
@@ -77,7 +107,51 @@ const aiCreationModes: Array<{ id: AiCreationMode; label: string; description: s
   { id: 'generate', label: '普通生成', description: '直接用本地确定性逻辑生成图纸' },
   { id: 'optimize', label: 'AI 优化', description: '先优化原图，再生成图纸' }
 ]
+const patternInputModes: Array<{ id: PatternInputMode; label: string; description: string }> = [
+  {
+    id: 'image',
+    label: '普通图片',
+    description: '按每个拼豆点位覆盖的原图面积取平均色，适合照片、插画和非标准尺寸图片。'
+  },
+  {
+    id: 'pixel-art',
+    label: '像素画',
+    description: '按像素块主色匹配；可手动校准缩放和偏移，让原图像素块对齐拼豆方格。'
+  }
+]
 
+
+
+const shortcutGroups = [
+  {
+    title: '\u7f16\u8f91\u5de5\u5177',
+    items: [
+      { keys: 'B / P', label: '\u753b\u7b14' },
+      { keys: 'E', label: '\u6a61\u76ae' },
+      { keys: 'F', label: '\u586b\u5145' },
+      { keys: 'I', label: '\u5438\u7ba1' }
+    ]
+  },
+  {
+    title: '\u5386\u53f2\u4e0e\u6587\u4ef6',
+    items: [
+      { keys: 'Ctrl Z', label: '\u64a4\u9500' },
+      { keys: 'Ctrl Shift Z / Ctrl Y', label: '\u91cd\u505a' },
+      { keys: 'Ctrl S', label: '\u4fdd\u5b58' },
+      { keys: 'Ctrl O', label: '\u6253\u5f00' }
+    ]
+  },
+  {
+    title: '\u9884\u89c8',
+    items: [
+      { keys: 'Space + \u62d6\u62fd', label: '\u5e73\u79fb\u753b\u5e03' },
+      { keys: 'Ctrl + \u6eda\u8f6e', label: '\u7f29\u653e\u753b\u5e03' },
+      { keys: '+ / - / 0', label: '\u7f29\u653e / \u590d\u4f4d' },
+      { keys: 'G / V', label: '\u6807\u53f7 / \u9884\u89c8\u6a21\u5f0f' },
+      { keys: 'Esc', label: '\u5173\u95ed\u9762\u677f' }
+    ]
+  }
+]
 
 const imageModelKeywords = [
   'image',
@@ -148,6 +222,13 @@ const maxColors = ref(24)
 const enableDithering = ref(true)
 const enablePixelCleanup = ref(true)
 const showGridLabels = ref(true)
+const pixelArtScale = ref(1)
+const pixelArtOffsetX = ref(0)
+const pixelArtOffsetY = ref(0)
+const isPixelArtCalibrationOpen = ref(false)
+const pixelArtDraftScale = ref(1)
+const pixelArtDraftOffsetX = ref(0)
+const pixelArtDraftOffsetY = ref(0)
 const patternPreviewMode = ref<PatternPreviewMode>('chart')
 const activeManufacturerPalette = computed(() => getManufacturerPalette(selectedManufacturer.value))
 const activePaletteColors = computed(() => activeManufacturerPalette.value.colors)
@@ -158,6 +239,8 @@ const createCurrentSamplePattern = (): PatternGrid => {
 const patternGrid = ref<PatternGrid>(createCurrentSamplePattern())
 const sourceFile = ref<File | null>(null)
 const sourcePreviewDataUrl = ref('')
+const sourceImageNaturalWidth = ref(0)
+const sourceImageNaturalHeight = ref(0)
 const isGenerating = ref(false)
 const isOptimizingImage = ref(false)
 const aiCreationMode = ref<AiCreationMode>('generate')
@@ -171,18 +254,39 @@ const aiReferenceDataUrl = ref('')
 const aiReferenceName = ref('')
 const selectedColorHex = ref(activePaletteColors.value[3]?.hex ?? activePaletteColors.value[0].hex)
 const isPalettePickerOpen = ref(false)
+const isShortcutHelpOpen = ref(false)
 const paletteSearchQuery = ref('')
 const isAiSettingsOpen = ref(false)
 const aiPrompt = ref('')
 const activeTool = ref<EditorTool>('pencil')
-const undoStack = ref<string[][]>([])
-const redoStack = ref<string[][]>([])
+const {
+  undoStack,
+  redoStack,
+  pushHistory,
+  setPatternCells,
+  replaceCell,
+  floodFill,
+  onCellClick,
+  undo,
+  redo
+} = usePatternEditor({
+  patternGrid,
+  activeTool,
+  selectedColorHex,
+  hasManualEdits,
+  generationMessage,
+  closeOverlays: () => {
+    isPalettePickerOpen.value = false
+    isShortcutHelpOpen.value = false
+  }
+})
 const projectFileInput = ref<HTMLInputElement | null>(null)
 const patternPreviewPanel = ref<HTMLElement | null>(null)
 const patternCanvasStage = ref<HTMLDivElement | null>(null)
 const patternCanvasShell = ref<HTMLDivElement | null>(null)
 const patternCanvas = ref<HTMLCanvasElement | null>(null)
 const patternCanvasFrame = ref<HTMLDivElement | null>(null)
+const pixelArtCalibrationStage = ref<HTMLDivElement | null>(null)
 const projectStatus = ref('尚未保存')
 const isPatternFullscreen = ref(false)
 const isPatternOverlayFullscreen = ref(false)
@@ -191,13 +295,16 @@ const canvasPanX = ref(0)
 const canvasPanY = ref(0)
 const canvasBaseSize = ref(420)
 const canvasPointerState = ref<CanvasPointerState | null>(null)
+const canvasPaintSession = ref<CanvasPaintSession | null>(null)
 const isCanvasDragging = ref(false)
 const isSpacePressed = ref(false)
 const isCanvasStageHovered = ref(false)
+const pixelArtCalibrationPointerState = ref<PixelArtCalibrationPointerState | null>(null)
 let generationToken = 0
 let sourcePreviewToken = 0
 let isApplyingProject = false
 let canvasResizeObserver: ResizeObserver | null = null
+let canvasRedrawFrame: number | null = null
 let aiOptimizeTimer: number | null = null
 
 const selectedProviderId = ref(NEW_PROVIDER_ID)
@@ -273,6 +380,64 @@ const providerNoticeMessage = computed(() => {
   return providerStatus.value
 })
 const isAiOptimizeMode = computed(() => aiCreationMode.value === 'optimize')
+const isPixelArtInputMode = computed(() => inputMode.value === 'pixel-art')
+const selectedPatternInputMode = computed(
+  () => patternInputModes.find((mode) => mode.id === inputMode.value) ?? patternInputModes[0]
+)
+const ditheringStatusLabel = computed(() => {
+  if (isAiOptimizeMode.value || isPixelArtInputMode.value) return '不参与'
+
+  return enableDithering.value ? '开启' : '关闭'
+})
+const cleanupStatusLabel = computed(() => {
+  if (isAiOptimizeMode.value || isPixelArtInputMode.value) return '不参与'
+
+  return enablePixelCleanup.value ? '开启' : '关闭'
+})
+const pixelArtCalibration = computed<PixelArtCalibration>(() => ({
+  scale: pixelArtScale.value,
+  offsetX: pixelArtOffsetX.value,
+  offsetY: pixelArtOffsetY.value
+}))
+const pixelArtCalibrationLabel = computed(() => {
+  return `缩放 ${pixelArtScale.value.toFixed(3)} · X ${pixelArtOffsetX.value.toFixed(2)} · Y ${pixelArtOffsetY.value.toFixed(2)}`
+})
+const getPixelArtImageStyle = (scale: number, offsetX: number, offsetY: number): Record<string, string> => {
+  const { columns, rows } = parseBoardSize(selectedBoardSize.value)
+
+  return {
+    width: `${(Math.max(1, sourceImageNaturalWidth.value) * scale * 100) / columns}%`,
+    height: `${(Math.max(1, sourceImageNaturalHeight.value) * scale * 100) / rows}%`,
+    left: `${(offsetX * 100) / columns}%`,
+    top: `${(offsetY * 100) / rows}%`
+  }
+}
+const pixelArtCalibrationImageStyle = computed(() =>
+  getPixelArtImageStyle(pixelArtScale.value, pixelArtOffsetX.value, pixelArtOffsetY.value)
+)
+const pixelArtCalibrationModalImageStyle = computed(() =>
+  getPixelArtImageStyle(pixelArtDraftScale.value, pixelArtDraftOffsetX.value, pixelArtDraftOffsetY.value)
+)
+const pixelArtCalibrationBoardStyle = computed<Record<string, string>>(() => {
+  const { columns, rows } = parseBoardSize(selectedBoardSize.value)
+
+  return {
+    aspectRatio: `${columns} / ${rows}`
+  }
+})
+const getPixelArtCalibrationGridStyle = (lineColor: string): Record<string, string> => {
+  const { columns, rows } = parseBoardSize(selectedBoardSize.value)
+
+  return {
+    backgroundImage: `linear-gradient(to right, ${lineColor} 1px, transparent 1px), linear-gradient(to bottom, ${lineColor} 1px, transparent 1px)`,
+    backgroundSize: `calc(100% / ${columns}) calc(100% / ${rows})`
+  }
+}
+const pixelArtCalibrationGridStyle = computed(() => getPixelArtCalibrationGridStyle('rgb(91 167 201 / 0.3)'))
+const pixelArtCalibrationModalGridStyle = computed(() => getPixelArtCalibrationGridStyle('rgb(91 167 201 / 0.35)'))
+const pixelArtCalibrationDraftLabel = computed(() => {
+  return `缩放 ${pixelArtDraftScale.value.toFixed(3)} · X ${pixelArtDraftOffsetX.value.toFixed(2)} · Y ${pixelArtDraftOffsetY.value.toFixed(2)}`
+})
 const aiOptimizeElapsedLabel = computed(() => {
   const minutes = Math.floor(aiOptimizeElapsedSeconds.value / 60)
   const seconds = aiOptimizeElapsedSeconds.value % 60
@@ -360,6 +525,165 @@ const selectPaletteColor = (colorHex: string): void => {
 
 const closePalettePicker = (): void => {
   isPalettePickerOpen.value = false
+  isShortcutHelpOpen.value = false
+}
+
+const resetPixelArtCalibration = (): void => {
+  const { columns, rows } = parseBoardSize(selectedBoardSize.value)
+  const sourceWidth = Math.max(1, sourceImageNaturalWidth.value)
+  const sourceHeight = Math.max(1, sourceImageNaturalHeight.value)
+  const scale = Math.min(columns / sourceWidth, rows / sourceHeight)
+  const fittedColumns = sourceWidth * scale
+  const fittedRows = sourceHeight * scale
+
+  pixelArtScale.value = Number(scale.toFixed(4))
+  pixelArtOffsetX.value = Number(((columns - fittedColumns) / 2).toFixed(3))
+  pixelArtOffsetY.value = Number(((rows - fittedRows) / 2).toFixed(3))
+}
+
+const resetPixelArtDraftCalibration = (): void => {
+  const { columns, rows } = parseBoardSize(selectedBoardSize.value)
+  const sourceWidth = Math.max(1, sourceImageNaturalWidth.value)
+  const sourceHeight = Math.max(1, sourceImageNaturalHeight.value)
+  const scale = Math.min(columns / sourceWidth, rows / sourceHeight)
+  const fittedColumns = sourceWidth * scale
+  const fittedRows = sourceHeight * scale
+
+  pixelArtDraftScale.value = Number(scale.toFixed(4))
+  pixelArtDraftOffsetX.value = Number(((columns - fittedColumns) / 2).toFixed(3))
+  pixelArtDraftOffsetY.value = Number(((rows - fittedRows) / 2).toFixed(3))
+}
+
+const adjustPixelArtScale = (amount: number): void => {
+  const nextScale = clampNumber(pixelArtScale.value + amount, 0.05, 8)
+  pixelArtScale.value = Number(nextScale.toFixed(4))
+}
+
+const nudgePixelArtCalibration = (axis: 'x' | 'y', amount: number): void => {
+  if (axis === 'x') {
+    pixelArtOffsetX.value = Number((pixelArtOffsetX.value + amount).toFixed(3))
+  } else {
+    pixelArtOffsetY.value = Number((pixelArtOffsetY.value + amount).toFixed(3))
+  }
+}
+
+const nudgePixelArtDraftCalibration = (axis: 'x' | 'y', amount: number): void => {
+  if (axis === 'x') {
+    pixelArtDraftOffsetX.value = Number((pixelArtDraftOffsetX.value + amount).toFixed(3))
+  } else {
+    pixelArtDraftOffsetY.value = Number((pixelArtDraftOffsetY.value + amount).toFixed(3))
+  }
+}
+
+const openPixelArtCalibration = (): void => {
+  if (!sourcePreviewDataUrl.value) return
+
+  pixelArtDraftScale.value = pixelArtScale.value
+  pixelArtDraftOffsetX.value = pixelArtOffsetX.value
+  pixelArtDraftOffsetY.value = pixelArtOffsetY.value
+  isPixelArtCalibrationOpen.value = true
+}
+
+const closePixelArtCalibration = (): void => {
+  isPixelArtCalibrationOpen.value = false
+  pixelArtCalibrationPointerState.value = null
+}
+
+const applyPixelArtCalibration = (): void => {
+  const shouldGenerateAfterApply = Boolean(sourceFile.value && !isGeneratedFromSourceImage() && !isGeneratedFromAiReference())
+
+  pixelArtScale.value = Number(pixelArtDraftScale.value.toFixed(4))
+  pixelArtOffsetX.value = Number(pixelArtDraftOffsetX.value.toFixed(3))
+  pixelArtOffsetY.value = Number(pixelArtDraftOffsetY.value.toFixed(3))
+  closePixelArtCalibration()
+
+  if (shouldGenerateAfterApply) {
+    void generatePatternFromSourceImage()
+  }
+}
+
+const updatePixelArtDraftScale = (
+  nextScale: number,
+  anchorClientX?: number,
+  anchorClientY?: number
+): void => {
+  const normalizedScale = clampNumber(Number.isFinite(nextScale) ? nextScale : 1, 0.01, 32)
+  const rect = pixelArtCalibrationStage.value?.getBoundingClientRect()
+
+  if (!rect) {
+    pixelArtDraftScale.value = Number(normalizedScale.toFixed(4))
+    return
+  }
+
+  const { columns, rows } = parseBoardSize(selectedBoardSize.value)
+  const anchorX = anchorClientX === undefined ? rect.width / 2 : clampNumber(anchorClientX - rect.left, 0, rect.width)
+  const anchorY = anchorClientY === undefined ? rect.height / 2 : clampNumber(anchorClientY - rect.top, 0, rect.height)
+  const gridX = (anchorX / Math.max(1, rect.width)) * columns
+  const gridY = (anchorY / Math.max(1, rect.height)) * rows
+  const sourceX = (gridX - pixelArtDraftOffsetX.value) / Math.max(0.01, pixelArtDraftScale.value)
+  const sourceY = (gridY - pixelArtDraftOffsetY.value) / Math.max(0.01, pixelArtDraftScale.value)
+
+  pixelArtDraftScale.value = Number(normalizedScale.toFixed(4))
+  pixelArtDraftOffsetX.value = Number((gridX - sourceX * normalizedScale).toFixed(3))
+  pixelArtDraftOffsetY.value = Number((gridY - sourceY * normalizedScale).toFixed(3))
+}
+
+const adjustPixelArtDraftScale = (amount: number): void => {
+  updatePixelArtDraftScale(pixelArtDraftScale.value + amount)
+}
+
+const onPixelArtCalibrationPointerDown = (event: PointerEvent): void => {
+  if (!sourcePreviewDataUrl.value || event.button !== 0) return
+
+  event.preventDefault()
+  const target = event.currentTarget as HTMLElement
+  target.setPointerCapture(event.pointerId)
+  pixelArtCalibrationPointerState.value = {
+    pointerId: event.pointerId,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startOffsetX: pixelArtDraftOffsetX.value,
+    startOffsetY: pixelArtDraftOffsetY.value
+  }
+}
+
+const onPixelArtCalibrationPointerMove = (event: PointerEvent): void => {
+  const pointerState = pixelArtCalibrationPointerState.value
+  const rect = pixelArtCalibrationStage.value?.getBoundingClientRect()
+  if (!pointerState || pointerState.pointerId !== event.pointerId || !rect) return
+
+  const { columns, rows } = parseBoardSize(selectedBoardSize.value)
+  const deltaX = ((event.clientX - pointerState.startClientX) / Math.max(1, rect.width)) * columns
+  const deltaY = ((event.clientY - pointerState.startClientY) / Math.max(1, rect.height)) * rows
+
+  pixelArtDraftOffsetX.value = Number((pointerState.startOffsetX + deltaX).toFixed(3))
+  pixelArtDraftOffsetY.value = Number((pointerState.startOffsetY + deltaY).toFixed(3))
+}
+
+const onPixelArtCalibrationPointerUp = (event: PointerEvent): void => {
+  if (pixelArtCalibrationPointerState.value?.pointerId !== event.pointerId) return
+
+  pixelArtCalibrationPointerState.value = null
+  const target = event.currentTarget as HTMLElement
+  if (target.hasPointerCapture(event.pointerId)) {
+    target.releasePointerCapture(event.pointerId)
+  }
+}
+
+const onPixelArtCalibrationWheel = (event: WheelEvent): void => {
+  event.preventDefault()
+  const zoomFactor = event.deltaY > 0 ? 0.94 : 1.06
+  updatePixelArtDraftScale(pixelArtDraftScale.value * zoomFactor, event.clientX, event.clientY)
+}
+
+const readImageSize = async (source: string): Promise<{ width: number; height: number }> => {
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+
+    image.onload = () => resolve({ width: image.naturalWidth || image.width, height: image.naturalHeight || image.height })
+    image.onerror = () => reject(new Error('图片尺寸读取失败'))
+    image.src = source
+  })
 }
 
 const themeOptions: Array<{ value: ThemePreference; icon: string; label: string }> = [
@@ -695,10 +1019,11 @@ const deleteProviderProfile = async (): Promise<void> => {
 const getPatternGenerationOptions = () => ({
   boardSize: selectedBoardSize.value,
   maxColors: maxColors.value,
-  dithering: !isAiOptimizeMode.value && enableDithering.value,
-  cleanup: !isAiOptimizeMode.value && enablePixelCleanup.value,
+  dithering: !isAiOptimizeMode.value && !isPixelArtInputMode.value && enableDithering.value,
+  cleanup: !isAiOptimizeMode.value && !isPixelArtInputMode.value && enablePixelCleanup.value,
   inputMode: inputMode.value,
-  palette: activePaletteColors.value
+  palette: activePaletteColors.value,
+  pixelArtCalibration: isPixelArtInputMode.value ? pixelArtCalibration.value : undefined
 })
 
 const MIN_CANVAS_ZOOM = 0.5
@@ -967,6 +1292,7 @@ const drawActualEffectCanvas = (
 }
 
 const drawPatternCanvas = (): void => {
+  canvasRedrawFrame = null
   const canvas = patternCanvas.value
   const frame = patternCanvasFrame.value
   if (!canvas || !frame) return
@@ -1030,13 +1356,16 @@ const drawPatternCanvas = (): void => {
   context.fillStyle = isDark ? '#191715' : '#f8f7f4'
   context.fillRect(metrics.gridX, metrics.gridY, metrics.gridSize, metrics.gridSize)
 
+  const canDrawCellDetails = cellSize >= 7
+  const shouldUseRoundedCells = cellSize >= 5.5
+
   for (let index = 0; index < cells.length; index += 1) {
     const color = cells[index]
     const x = index % columns
     const y = Math.floor(index / columns)
     const cellX = metrics.gridX + x * cellSize
     const cellY = metrics.gridY + y * cellSize
-    const inset = Math.max(0.8, Math.min(2.2, cellSize * 0.1))
+    const inset = Math.max(0.45, Math.min(2.2, cellSize * 0.1))
 
     if (isEmptyCell(color)) {
       context.fillStyle = (x + y) % 2 === 0 ? (isDark ? '#211f1c' : '#ffffff') : (isDark ? '#25221f' : '#f3f0ea')
@@ -1045,17 +1374,26 @@ const drawPatternCanvas = (): void => {
     }
 
     context.fillStyle = color
-    drawRoundedRect(
-      context,
-      cellX + inset,
-      cellY + inset,
-      Math.max(0.5, cellSize - inset * 2),
-      Math.max(0.5, cellSize - inset * 2),
-      Math.max(1, cellSize * 0.14)
-    )
-    context.fill()
+    if (shouldUseRoundedCells) {
+      drawRoundedRect(
+        context,
+        cellX + inset,
+        cellY + inset,
+        Math.max(0.5, cellSize - inset * 2),
+        Math.max(0.5, cellSize - inset * 2),
+        Math.max(1, cellSize * 0.14)
+      )
+      context.fill()
+    } else {
+      context.fillRect(
+        cellX + inset,
+        cellY + inset,
+        Math.max(0.5, cellSize - inset * 2),
+        Math.max(0.5, cellSize - inset * 2)
+      )
+    }
 
-    if (cellSize >= 7) {
+    if (canDrawCellDetails) {
       context.fillStyle = 'rgb(255 255 255 / 0.22)'
       context.beginPath()
       context.arc(cellX + cellSize * 0.36, cellY + cellSize * 0.32, Math.max(0.8, cellSize * 0.11), 0, Math.PI * 2)
@@ -1065,49 +1403,51 @@ const drawPatternCanvas = (): void => {
 
   context.strokeStyle = isDark ? 'rgb(255 255 255 / 0.12)' : 'rgb(25 23 21 / 0.14)'
   context.lineWidth = 1
+  context.beginPath()
 
   for (let x = 0; x <= columns; x += 1) {
     const lineX = Math.round(metrics.gridX + x * cellSize) + 0.5
 
-    context.beginPath()
     context.moveTo(lineX, metrics.gridY)
     context.lineTo(lineX, metrics.gridY + metrics.gridSize)
-    context.stroke()
   }
 
   for (let y = 0; y <= rows; y += 1) {
     const lineY = Math.round(metrics.gridY + y * cellSize) + 0.5
 
-    context.beginPath()
     context.moveTo(metrics.gridX, lineY)
     context.lineTo(metrics.gridX + metrics.gridSize, lineY)
-    context.stroke()
   }
+  context.stroke()
 
   context.strokeStyle = isDark ? 'rgb(255 255 255 / 0.42)' : 'rgb(25 23 21 / 0.48)'
   context.lineWidth = 1.5
+  context.beginPath()
 
   for (let x = 0; x <= columns; x += 5) {
     const lineX = Math.round(metrics.gridX + x * cellSize) + 0.5
 
-    context.beginPath()
     context.moveTo(lineX, metrics.gridY)
     context.lineTo(lineX, metrics.gridY + metrics.gridSize)
-    context.stroke()
   }
 
   for (let y = 0; y <= rows; y += 5) {
     const lineY = Math.round(metrics.gridY + y * cellSize) + 0.5
 
-    context.beginPath()
     context.moveTo(metrics.gridX, lineY)
     context.lineTo(metrics.gridX + metrics.gridSize, lineY)
-    context.stroke()
   }
+  context.stroke()
 
   context.strokeStyle = isDark ? 'rgb(255 255 255 / 0.55)' : 'rgb(25 23 21 / 0.55)'
   context.lineWidth = 2
   context.strokeRect(metrics.gridX + 0.5, metrics.gridY + 0.5, metrics.gridSize - 1, metrics.gridSize - 1)
+}
+
+const schedulePatternCanvasDraw = (): void => {
+  if (canvasRedrawFrame !== null) return
+
+  canvasRedrawFrame = window.requestAnimationFrame(drawPatternCanvas)
 }
 
 const getCanvasCellIndex = (event: MouseEvent | PointerEvent): number | null => {
@@ -1132,6 +1472,71 @@ const getCanvasCellIndex = (event: MouseEvent | PointerEvent): number | null => 
   return row * previewColumns.value + column
 }
 
+
+const getPaintColorForActiveTool = (): string | null => {
+  if (activeTool.value === 'pencil') return selectedColorHex.value
+  if (activeTool.value === 'eraser') return EMPTY_CELL
+  return null
+}
+
+const applyCanvasPaintIndex = (index: number): void => {
+  const session = canvasPaintSession.value
+  if (!session || session.lastIndex === index) return
+
+  session.lastIndex = index
+
+  if (session.cells[index] === session.nextColor) return
+
+  if (!session.pushedHistory) {
+    pushHistory()
+    session.pushedHistory = true
+  }
+
+  session.cells[index] = session.nextColor
+  session.hasChanges = true
+  patternGrid.value = {
+    ...patternGrid.value,
+    cells: [...session.cells]
+  }
+  hasManualEdits.value = true
+  generationMessage.value = '\u624b\u5de5\u7f16\u8f91\u672a\u5bfc\u51fa'
+}
+
+const beginCanvasPaintSession = (startIndex: number, nextColor: string): void => {
+  canvasPaintSession.value = {
+    cells: [...patternGrid.value.cells],
+    hasChanges: false,
+    lastIndex: null,
+    nextColor,
+    pushedHistory: false
+  }
+  applyCanvasPaintIndex(startIndex)
+}
+
+const finishCanvasPaintSession = (): void => {
+  const session = canvasPaintSession.value
+  if (!session) return
+
+  canvasPaintSession.value = null
+  if (session.hasChanges) return
+}
+
+const cancelCanvasPaintSession = (): void => {
+  const session = canvasPaintSession.value
+  if (!session) return
+
+  canvasPaintSession.value = null
+  if (!session.pushedHistory) return
+
+  const previousCells = undoStack.value.pop()
+  if (previousCells) {
+    patternGrid.value = {
+      ...patternGrid.value,
+      cells: previousCells
+    }
+  }
+}
+
 const onCanvasWheel = (event: WheelEvent): void => {
   if (!event.ctrlKey) return
 
@@ -1144,6 +1549,10 @@ const onCanvasPointerDown = (event: PointerEvent): void => {
   if (event.button !== 0) return
 
   const isPanMode = isSpacePressed.value || isActualEffectPreview.value
+  const paintColor = getPaintColorForActiveTool()
+  const startIndex = !isPanMode && paintColor !== null ? getCanvasCellIndex(event) : null
+  const isPaintMode = startIndex !== null
+
   if (patternCanvasStage.value && !patternCanvasStage.value.hasPointerCapture(event.pointerId)) {
     patternCanvasStage.value.setPointerCapture(event.pointerId)
   }
@@ -1151,12 +1560,19 @@ const onCanvasPointerDown = (event: PointerEvent): void => {
     pointerId: event.pointerId,
     button: event.button,
     isPanMode,
+    isPaintMode,
     startClientX: event.clientX,
     startClientY: event.clientY,
     startPanX: canvasPanX.value,
     startPanY: canvasPanY.value
   }
   isCanvasDragging.value = false
+
+  if (isPaintMode && startIndex !== null && paintColor !== null) {
+    beginCanvasPaintSession(startIndex, paintColor)
+    event.preventDefault()
+    return
+  }
 
   if (isPanMode) {
     event.preventDefault()
@@ -1172,6 +1588,15 @@ const onCanvasPointerMove = (event: PointerEvent): void => {
 
   if (!isCanvasDragging.value && Math.hypot(deltaX, deltaY) > CANVAS_DRAG_THRESHOLD) {
     isCanvasDragging.value = true
+  }
+
+  if (pointerState.isPaintMode) {
+    const index = getCanvasCellIndex(event)
+    if (index !== null) {
+      applyCanvasPaintIndex(index)
+    }
+    event.preventDefault()
+    return
   }
 
   if (!pointerState.isPanMode || !isCanvasDragging.value) return
@@ -1202,6 +1627,12 @@ const onCanvasPointerUp = (event: PointerEvent): void => {
     patternCanvasStage.value.releasePointerCapture(event.pointerId)
   }
 
+  if (pointerState.isPaintMode) {
+    finishCanvasPaintSession()
+    event.preventDefault()
+    return
+  }
+
   if (pointerState.isPanMode || didDrag || isActualEffectPreview.value) return
 
   const index = getCanvasCellIndex(event)
@@ -1213,6 +1644,7 @@ const onCanvasPointerUp = (event: PointerEvent): void => {
 const onCanvasPointerCancel = (event: PointerEvent): void => {
   if (canvasPointerState.value?.pointerId !== event.pointerId) return
 
+  cancelCanvasPaintSession()
   canvasPointerState.value = null
   isCanvasDragging.value = false
   if (patternCanvasStage.value?.hasPointerCapture(event.pointerId)) {
@@ -1243,7 +1675,7 @@ const isSpaceKeyEvent = (event: KeyboardEvent): boolean => {
 
 const syncPatternFullscreenState = (): void => {
   isPatternFullscreen.value = document.fullscreenElement === patternPreviewPanel.value || isPatternOverlayFullscreen.value
-  void nextTick(drawPatternCanvas)
+  void nextTick(schedulePatternCanvasDraw)
 }
 
 const togglePatternFullscreen = async (): Promise<void> => {
@@ -1280,6 +1712,17 @@ const togglePatternFullscreen = async (): Promise<void> => {
   }
 }
 
+const selectEditorTool = (tool: EditorTool): void => {
+  patternPreviewMode.value = 'chart'
+  activeTool.value = tool
+  isPalettePickerOpen.value = false
+  isShortcutHelpOpen.value = false
+}
+
+const canUseEditorShortcut = (event: KeyboardEvent): boolean => {
+  return !isEditableEventTarget(event.target) && !isPixelArtCalibrationOpen.value
+}
+
 const onPatternPreviewKeydown = (event: KeyboardEvent): void => {
   if (isSpaceKeyEvent(event) && (!isEditableEventTarget(event.target) || isCanvasStageHovered.value)) {
     isSpacePressed.value = true
@@ -1287,22 +1730,122 @@ const onPatternPreviewKeydown = (event: KeyboardEvent): void => {
     return
   }
 
-  if (event.key !== 'Escape') return
+  if (event.key === 'Escape') {
+    if (isPixelArtCalibrationOpen.value) {
+      closePixelArtCalibration()
+      return
+    }
 
-  if (isAiSettingsOpen.value) {
-    isAiSettingsOpen.value = false
+    if (isAiSettingsOpen.value) {
+      isAiSettingsOpen.value = false
+      return
+    }
+
+    if (isPalettePickerOpen.value) {
+      isPalettePickerOpen.value = false
+      return
+    }
+
+    if (isShortcutHelpOpen.value) {
+      isShortcutHelpOpen.value = false
+      return
+    }
+
+    if (!isPatternOverlayFullscreen.value) return
+
+    isPatternOverlayFullscreen.value = false
+    syncPatternFullscreenState()
     return
   }
 
-  if (isPalettePickerOpen.value) {
-    isPalettePickerOpen.value = false
+  if (!canUseEditorShortcut(event)) return
+
+  const key = event.key.toLowerCase()
+  const hasCommandModifier = event.ctrlKey || event.metaKey
+
+  if (hasCommandModifier && key === 'z') {
+    event.preventDefault()
+    if (event.shiftKey) {
+      redo()
+    } else {
+      undo()
+    }
     return
   }
 
-  if (!isPatternOverlayFullscreen.value) return
+  if (hasCommandModifier && key === 'y') {
+    event.preventDefault()
+    redo()
+    return
+  }
 
-  isPatternOverlayFullscreen.value = false
-  syncPatternFullscreenState()
+  if (hasCommandModifier && key === 's') {
+    event.preventDefault()
+    void saveProject()
+    return
+  }
+
+  if (hasCommandModifier && key === 'o') {
+    event.preventDefault()
+    void openProject()
+    return
+  }
+
+  if (hasCommandModifier || event.altKey) return
+
+  if (key === 'b' || key === 'p') {
+    event.preventDefault()
+    selectEditorTool('pencil')
+    return
+  }
+
+  if (key === 'e') {
+    event.preventDefault()
+    selectEditorTool('eraser')
+    return
+  }
+
+  if (key === 'f') {
+    event.preventDefault()
+    selectEditorTool('fill')
+    return
+  }
+
+  if (key === 'i') {
+    event.preventDefault()
+    selectEditorTool('eyedropper')
+    return
+  }
+
+  if (key === 'g') {
+    event.preventDefault()
+    showGridLabels.value = !showGridLabels.value
+    return
+  }
+
+  if (key === 'v') {
+    event.preventDefault()
+    patternPreviewMode.value = patternPreviewMode.value === 'chart' ? 'effect' : 'chart'
+    return
+  }
+
+  if (key === '+' || key === '=') {
+    event.preventDefault()
+    zoomCanvasIn()
+    return
+  }
+
+  if (key === '-' || key === '_') {
+    event.preventDefault()
+    zoomCanvasOut()
+    return
+  }
+
+  if (key === '0') {
+    event.preventDefault()
+    resetCanvasViewport()
+    return
+  }
 }
 
 const onPatternPreviewKeyup = (event: KeyboardEvent): void => {
@@ -1312,6 +1855,7 @@ const onPatternPreviewKeyup = (event: KeyboardEvent): void => {
 }
 
 const resetCanvasInteraction = (): void => {
+  finishCanvasPaintSession()
   isSpacePressed.value = false
   isCanvasStageHovered.value = false
   canvasPointerState.value = null
@@ -1346,6 +1890,7 @@ const buildSavedProject = (): SavedProject => {
       boardSize: selectedBoardSize.value,
       maxColors: maxColors.value,
       inputMode: inputMode.value,
+      pixelArtCalibration: pixelArtCalibration.value,
       dithering: enableDithering.value,
       cleanup: enablePixelCleanup.value,
       showLabels: showGridLabels.value
@@ -1371,6 +1916,9 @@ const applySavedProject = (project: SavedProject, displayName: string): void => 
   selectedManufacturer.value = getManufacturerPalette(project.board.manufacturer).id
   selectedBoardSize.value = project.board.boardSize
   inputMode.value = project.board.inputMode ?? 'image'
+  pixelArtScale.value = project.board.pixelArtCalibration?.scale ?? 1
+  pixelArtOffsetX.value = project.board.pixelArtCalibration?.offsetX ?? 0
+  pixelArtOffsetY.value = project.board.pixelArtCalibration?.offsetY ?? 0
   maxColors.value = project.board.maxColors
   enableDithering.value = project.board.dithering
   enablePixelCleanup.value = project.board.cleanup ?? true
@@ -1395,6 +1943,8 @@ const applySavedProject = (project: SavedProject, displayName: string): void => 
   capabilitiesByModel.value = { ...(matchingProvider?.capabilitiesByModel ?? {}) }
   sourceFile.value = null
   sourcePreviewDataUrl.value = ''
+  sourceImageNaturalWidth.value = 0
+  sourceImageNaturalHeight.value = 0
   aiReferenceDataUrl.value = ''
   aiReferenceName.value = ''
   aiOptimizeStatus.value = ''
@@ -1932,10 +2482,14 @@ const onImageSelected = async (event: Event): Promise<void> => {
 
   try {
     const dataUrl = await readImageFileAsDataUrl(file)
+    const imageSize = await readImageSize(dataUrl)
 
     if (previewToken !== sourcePreviewToken) return
 
     sourcePreviewDataUrl.value = dataUrl
+    sourceImageNaturalWidth.value = imageSize.width
+    sourceImageNaturalHeight.value = imageSize.height
+    resetPixelArtCalibration()
   } catch (error) {
     if (previewToken !== sourcePreviewToken) return
 
@@ -1947,7 +2501,19 @@ const onAiImageSelected = async (event: Event): Promise<void> => {
   await onImageSelected(event)
 }
 
-watch([selectedManufacturer, selectedBoardSize, inputMode, maxColors, enableDithering, enablePixelCleanup], () => {
+watch(
+  [
+    selectedManufacturer,
+    selectedBoardSize,
+    inputMode,
+    maxColors,
+    enableDithering,
+    enablePixelCleanup,
+    pixelArtScale,
+    pixelArtOffsetX,
+    pixelArtOffsetY
+  ],
+  () => {
   if (isApplyingProject) return
 
   const paletteColors = activePaletteColors.value
@@ -1986,105 +2552,8 @@ watch([selectedManufacturer, selectedBoardSize, inputMode, maxColors, enableDith
   generationMessage.value = sourceFile.value
     ? '图纸配置已更新，当前画布已保留；点击生成后应用新配置'
     : '图纸配置已更新，当前画布已保留'
-})
-
-const pushHistory = (): void => {
-  undoStack.value.push([...patternGrid.value.cells])
-  if (undoStack.value.length > 40) {
-    undoStack.value.shift()
   }
-  redoStack.value = []
-}
-
-const setPatternCells = (cells: string[]): void => {
-  patternGrid.value = {
-    ...patternGrid.value,
-    cells
-  }
-  hasManualEdits.value = true
-  generationMessage.value = '手工编辑未导出'
-}
-
-const replaceCell = (index: number, nextColor: string): void => {
-  if (patternGrid.value.cells[index] === nextColor) return
-
-  pushHistory()
-  const nextCells = [...patternGrid.value.cells]
-  nextCells[index] = nextColor
-  setPatternCells(nextCells)
-}
-
-const floodFill = (startIndex: number, nextColor: string): void => {
-  const targetColor = patternGrid.value.cells[startIndex]
-  if (targetColor === nextColor) return
-
-  pushHistory()
-  const nextCells = [...patternGrid.value.cells]
-  const stack = [startIndex]
-  const visited = new Set<number>()
-  const { columns, rows } = patternGrid.value
-
-  while (stack.length > 0) {
-    const index = stack.pop()
-    if (index === undefined || visited.has(index) || nextCells[index] !== targetColor) continue
-
-    visited.add(index)
-    nextCells[index] = nextColor
-
-    const x = index % columns
-    const y = Math.floor(index / columns)
-    if (x > 0) stack.push(index - 1)
-    if (x < columns - 1) stack.push(index + 1)
-    if (y > 0) stack.push(index - columns)
-    if (y < rows - 1) stack.push(index + columns)
-  }
-
-  setPatternCells(nextCells)
-}
-
-const onCellClick = (index: number): void => {
-  isPalettePickerOpen.value = false
-  const currentColor = patternGrid.value.cells[index]
-
-  if (activeTool.value === 'eyedropper') {
-    if (isEmptyCell(currentColor)) {
-      activeTool.value = 'eraser'
-      return
-    }
-
-    selectedColorHex.value = currentColor
-    activeTool.value = 'pencil'
-    return
-  }
-
-  if (activeTool.value === 'eraser') {
-    replaceCell(index, EMPTY_CELL)
-    return
-  }
-
-  if (activeTool.value === 'fill') {
-    floodFill(index, selectedColorHex.value)
-    return
-  }
-
-  replaceCell(index, selectedColorHex.value)
-}
-
-const undo = (): void => {
-  const previousCells = undoStack.value.pop()
-  if (!previousCells) return
-
-  redoStack.value.push([...patternGrid.value.cells])
-  setPatternCells(previousCells)
-}
-
-const redo = (): void => {
-  const nextCells = redoStack.value.pop()
-  if (!nextCells) return
-
-  undoStack.value.push([...patternGrid.value.cells])
-  setPatternCells(nextCells)
-}
+)
 
 const exportPattern = (): void => {
   try {
@@ -2136,11 +2605,11 @@ watch(aiCreationMode, () => {
 })
 
 watch([patternGrid, showGridLabels, resolvedTheme, patternPreviewMode], () => {
-  void nextTick(drawPatternCanvas)
+  void nextTick(schedulePatternCanvasDraw)
 }, { deep: true })
 
 watch(canvasBaseSize, () => {
-  void nextTick(drawPatternCanvas)
+  void nextTick(schedulePatternCanvasDraw)
 })
 
 onMounted(() => {
@@ -2151,13 +2620,13 @@ onMounted(() => {
   window.addEventListener('blur', resetCanvasInteraction)
   void nextTick(() => {
     updateCanvasBaseSize()
-    drawPatternCanvas()
+    schedulePatternCanvasDraw()
 
     if (patternCanvasStage.value) {
       canvasResizeObserver = new ResizeObserver(() => {
         updateCanvasBaseSize()
         setCanvasViewport(canvasZoom.value)
-        void nextTick(drawPatternCanvas)
+        void nextTick(schedulePatternCanvasDraw)
       })
       canvasResizeObserver.observe(patternCanvasStage.value)
     }
@@ -2171,106 +2640,37 @@ onBeforeUnmount(() => {
   window.removeEventListener('blur', resetCanvasInteraction)
   canvasResizeObserver?.disconnect()
   canvasResizeObserver = null
+  if (canvasRedrawFrame !== null) {
+    window.cancelAnimationFrame(canvasRedrawFrame)
+    canvasRedrawFrame = null
+  }
   stopAiOptimizeTimer()
 })
 </script>
 
 <template>
   <div class="flex h-screen flex-col bg-ink-50 text-ink-900 dark:bg-ink-900 dark:text-ink-50" @click="closePalettePicker">
-    <header
-      class="flex h-16 shrink-0 items-center justify-between border-b border-ink-100 bg-white/82 px-5 dark:border-white/10 dark:bg-ink-800/78"
-    >
-      <div class="flex min-w-0 items-center gap-3">
-        <div class="grid h-10 w-10 shrink-0 grid-cols-3 gap-0.5 rounded-md bg-ink-900 p-1 dark:bg-ink-50">
-          <span class="rounded-sm bg-bead-coral"></span>
-          <span class="rounded-sm bg-bead-mint"></span>
-          <span class="rounded-sm bg-bead-amber"></span>
-          <span class="rounded-sm bg-bead-sky"></span>
-          <span class="rounded-sm bg-ink-50 dark:bg-ink-900"></span>
-          <span class="rounded-sm bg-bead-violet"></span>
-          <span class="rounded-sm bg-bead-amber"></span>
-          <span class="rounded-sm bg-bead-coral"></span>
-          <span class="rounded-sm bg-bead-mint"></span>
-        </div>
-        <div class="min-w-0">
-          <h1 class="truncate text-base font-semibold">拼豆图纸工作台</h1>
-          <p class="truncate text-xs text-ink-600 dark:text-ink-300">
-            {{ previewColumns }} x {{ previewRows }} · {{ activeManufacturerPalette.name }} · {{ usedColors.length }} 色
-          </p>
-        </div>
-      </div>
-
-      <div class="flex items-center gap-2">
-        <div class="grid grid-cols-3 gap-1 rounded-md border border-ink-200 bg-ink-100 p-1 dark:border-white/10 dark:bg-ink-900">
-          <button
-            v-for="option in themeOptions"
-            :key="option.value"
-            type="button"
-            class="flex h-8 w-8 items-center justify-center rounded transition hover:brightness-105"
-            :style="
-              preference === option.value
-                ? {
-                    backgroundColor: resolvedTheme === 'dark' ? '#f8f7f4' : '#ffffff',
-                    color: '#191715',
-                    boxShadow: '0 1px 2px rgb(25 23 21 / 0.16)'
-                  }
-                : {
-                    backgroundColor: 'transparent',
-                    color: resolvedTheme === 'dark' ? '#ece8df' : '#63594d'
-                  }
-            "
-            :title="`主题: ${option.label}`"
-            @click="setPreference(option.value)"
-          >
-            <Icon :icon="option.icon" class="h-4 w-4" />
-          </button>
-        </div>
-
-        <button
-          class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-          type="button"
-          title="打开项目"
-          @click="openProject"
-        >
-          <Icon icon="ri:folder-open-line" class="h-4 w-4" />
-          <span>打开</span>
-        </button>
-        <button
-          class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-          type="button"
-          title="保存项目"
-          @click="saveProject"
-        >
-          <Icon icon="ri:save-3-line" class="h-4 w-4" />
-          <span>保存</span>
-        </button>
-        <input
-          ref="projectFileInput"
-          class="hidden"
-          type="file"
-          accept=".pbd.json,.json,application/json"
-          @change="onProjectFileSelected"
-        />
-        <button
-          class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-          type="button"
-          title="打印或另存为 PDF"
-          @click="printPattern"
-        >
-          <Icon icon="ri:printer-line" class="h-4 w-4" />
-          <span>打印</span>
-        </button>
-        <button
-          class="inline-flex items-center gap-2 rounded-md border border-ink-200 px-3 py-2 text-sm text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-          type="button"
-          title="导出 PNG 图纸"
-          @click="exportPattern"
-        >
-          <Icon icon="ri:file-download-line" class="h-4 w-4" />
-          <span>导出</span>
-        </button>
-      </div>
-    </header>
+    <AppHeader
+      :preview-columns="previewColumns"
+      :preview-rows="previewRows"
+      :manufacturer-name="activeManufacturerPalette.name"
+      :used-color-count="usedColors.length"
+      :theme-options="themeOptions"
+      :preference="preference"
+      :resolved-theme="resolvedTheme"
+      @set-preference="setPreference"
+      @open-project="openProject"
+      @save-project="saveProject"
+      @print-pattern="printPattern"
+      @export-pattern="exportPattern"
+    />
+    <input
+      ref="projectFileInput"
+      class="hidden"
+      type="file"
+      accept=".pbd.json,.json,application/json"
+      @change="onProjectFileSelected"
+    />
 
     <main class="flex min-h-0 flex-1 flex-col">
       <div
@@ -2279,136 +2679,47 @@ onBeforeUnmount(() => {
         <section
           class="tool-scroll min-h-0 overflow-auto rounded-md border border-ink-100 bg-white p-4 shadow-panel dark:border-white/10 dark:bg-ink-800"
         >
-          <div>
-            <div class="mb-4 flex items-center gap-2">
-              <Icon icon="ri:settings-3-line" class="h-5 w-5 text-bead-coral" />
-              <h3 class="text-sm font-semibold">图纸规格</h3>
-            </div>
+          <PatternSettingsPanel
+            v-model:selected-manufacturer="selectedManufacturer"
+            v-model:selected-board-size="selectedBoardSize"
+            v-model:input-mode="inputMode"
+            v-model:max-colors="maxColors"
+            v-model:enable-dithering="enableDithering"
+            v-model:enable-pixel-cleanup="enablePixelCleanup"
+            v-model:show-grid-labels="showGridLabels"
+            :manufacturer-palettes="manufacturerPalettes"
+            :board-sizes="boardSizes"
+            :pattern-input-modes="patternInputModes"
+            :selected-pattern-input-mode-description="selectedPatternInputMode.description"
+            :active-palette-color-count="activePaletteColors.length"
+            :is-pixel-art-input-mode="isPixelArtInputMode"
+            :is-ai-optimize-mode="isAiOptimizeMode"
+            :source-preview-data-url="sourcePreviewDataUrl"
+            :pixel-art-calibration-board-style="pixelArtCalibrationBoardStyle"
+            :pixel-art-calibration-image-style="pixelArtCalibrationImageStyle"
+            :pixel-art-calibration-grid-style="pixelArtCalibrationGridStyle"
+            :pixel-art-scale="pixelArtScale"
+            :pixel-art-offset-x="pixelArtOffsetX"
+            :pixel-art-offset-y="pixelArtOffsetY"
+            :pixel-art-calibration-label="pixelArtCalibrationLabel"
+            :source-name="patternGrid.sourceName"
+            :generation-message="generationMessage"
+            :generation-error="generationError"
+            :project-status="projectStatus"
+            :resolved-theme="resolvedTheme"
+            @reset-pixel-art-calibration="resetPixelArtCalibration"
+            @open-pixel-art-calibration="openPixelArtCalibration"
+            @adjust-pixel-art-scale="adjustPixelArtScale"
+            @update-pixel-art-scale="(value) => { pixelArtScale = value }"
+            @update-pixel-art-offset-x="(value) => { pixelArtOffsetX = value }"
+            @update-pixel-art-offset-y="(value) => { pixelArtOffsetY = value }"
+            @nudge-pixel-art-calibration="nudgePixelArtCalibration"
+          />
 
-            <div class="space-y-4">
-              <label class="block space-y-1.5">
-                <span class="text-xs font-medium text-ink-600 dark:text-ink-300">厂商色卡</span>
-                <select
-                  v-model="selectedManufacturer"
-                  class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-mint dark:border-white/10 dark:bg-ink-900"
-                >
-                  <option
-                    v-for="palette in manufacturerPalettes"
-                    :key="palette.id"
-                    :value="palette.id"
-                  >
-                    {{ palette.name }} · {{ palette.colors.length }} 色
-                  </option>
-                </select>
-              </label>
-
-              <label class="block space-y-1.5">
-                <span class="text-xs font-medium text-ink-600 dark:text-ink-300">画板规格</span>
-                <select
-                  v-model="selectedBoardSize"
-                  class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm outline-none focus:border-bead-mint dark:border-white/10 dark:bg-ink-900"
-                >
-                  <option v-for="size in boardSizes" :key="size">{{ size }}</option>
-                </select>
-              </label>
-
-              <label class="block space-y-2">
-                <span class="flex items-center justify-between text-xs font-medium text-ink-600 dark:text-ink-300">
-                  <span>最大颜色数</span>
-                  <span>{{ maxColors }}</span>
-                </span>
-                <input
-                  v-model.number="maxColors"
-                  class="w-full accent-bead-coral"
-                  type="range"
-                  min="8"
-                  :max="activePaletteColors.length"
-                  step="1"
-                />
-              </label>
-
-              <label
-                v-if="!isAiOptimizeMode"
-                class="flex items-center justify-between rounded-md border border-ink-100 px-3 py-2 dark:border-white/10"
-              >
-                <span class="text-sm">开启抖色</span>
-                <input v-model="enableDithering" class="h-4 w-4 accent-bead-mint" type="checkbox" />
-              </label>
-
-              <label
-                v-if="!isAiOptimizeMode"
-                class="flex items-center justify-between rounded-md border border-ink-100 px-3 py-2 dark:border-white/10"
-              >
-                <span class="text-sm">像素清理</span>
-                <input v-model="enablePixelCleanup" class="h-4 w-4 accent-bead-amber" type="checkbox" />
-              </label>
-
-              <label
-                class="flex items-center justify-between rounded-md border border-ink-100 px-3 py-2 dark:border-white/10"
-              >
-                <span class="text-sm">显示标号</span>
-                <input v-model="showGridLabels" class="h-4 w-4 accent-bead-sky" type="checkbox" />
-              </label>
-
-              <div class="rounded-md border border-ink-100 p-3 text-xs dark:border-white/10">
-                <span class="block text-ink-500 dark:text-ink-400">来源</span>
-                <strong class="mt-1 block truncate">{{ patternGrid.sourceName }}</strong>
-                <span
-                  class="mt-2 block text-ink-600 dark:text-ink-300"
-                  :class="generationError ? 'text-bead-coral' : ''"
-                >
-                  {{ generationError || generationMessage }}
-                </span>
-                <span class="mt-1 block text-ink-500 dark:text-ink-400">
-                  {{ projectStatus }}
-                </span>
-                <span v-if="isAiOptimizeMode" class="mt-2 block text-bead-sky">
-                  AI 优化：抖色和像素清理暂不参与本次生成
-                </span>
-              </div>
-            </div>
-          </div>
-
-          <div class="mt-6 border-t border-ink-100 pt-4 dark:border-white/10">
-            <div class="mb-3 flex items-center justify-between gap-2">
-              <div class="flex items-center gap-2">
-                <Icon icon="ri:file-list-3-line" class="h-5 w-5 text-bead-amber" />
-                <h3 class="text-sm font-semibold">用珠清单</h3>
-              </div>
-              <button
-                type="button"
-                class="inline-flex items-center gap-1 rounded-md border border-ink-200 px-2 py-1 text-xs text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-                title="导出 CSV 清单"
-                @click="exportInventory"
-              >
-                <Icon icon="ri:download-2-line" class="h-3.5 w-3.5" />
-                <span>CSV</span>
-              </button>
-            </div>
-
-            <div class="rounded-md border border-ink-100 dark:border-white/10">
-              <div
-                v-for="item in beadInventory"
-                :key="item.hex"
-                class="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 border-b border-ink-100 px-2 py-2 text-xs last:border-b-0 dark:border-white/10"
-              >
-                <span
-                  class="h-5 w-5 rounded-sm border border-ink-200 dark:border-white/10"
-                  :style="{ backgroundColor: item.hex }"
-                ></span>
-                <div class="min-w-0">
-                  <strong class="block truncate">{{ item.id }} · {{ item.name }}</strong>
-                  <span class="block truncate text-ink-500 dark:text-ink-400">{{ item.hex }}</span>
-                </div>
-                <div class="text-right">
-                  <strong class="block">{{ item.count }}</strong>
-                  <span class="block text-[10px] text-ink-500 dark:text-ink-400">
-                    {{ (item.percentage * 100).toFixed(1) }}%
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
+          <BeadInventoryPanel
+            :bead-inventory="beadInventory"
+            @export-inventory="exportInventory"
+          />
         </section>
 
         <section
@@ -2416,98 +2727,28 @@ onBeforeUnmount(() => {
           class="pattern-preview-panel flex min-h-0 flex-col rounded-md border border-ink-100 bg-white shadow-panel dark:border-white/10 dark:bg-ink-800"
           :class="{ 'is-overlay-fullscreen': isPatternOverlayFullscreen }"
         >
-          <div class="flex items-center justify-between border-b border-ink-100 px-4 py-3 dark:border-white/10">
-            <div class="flex items-center gap-2">
-              <Icon icon="ri:grid-line" class="h-5 w-5 text-bead-mint" />
-              <h3 class="text-sm font-semibold">图纸预览</h3>
-            </div>
-            <div class="flex items-center gap-1">
-              <button
-                class="rounded-md p-2 text-ink-600 transition hover:bg-ink-100 disabled:opacity-40 dark:text-ink-300 dark:hover:bg-white/10"
-                type="button"
-                title="缩小"
-                :disabled="canvasZoom <= 0.5"
-                @click="zoomCanvasOut"
-              >
-                <Icon icon="ri:zoom-out-line" class="h-4 w-4" />
-              </button>
-              <button
-                class="min-w-14 rounded-md px-2 py-1.5 text-xs font-semibold text-ink-600 transition hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10"
-                type="button"
-                title="重置缩放和位置"
-                @click="resetCanvasViewport"
-              >
-                {{ canvasZoomPercent }}%
-              </button>
-              <button
-                class="rounded-md p-2 text-ink-600 transition hover:bg-ink-100 disabled:opacity-40 dark:text-ink-300 dark:hover:bg-white/10"
-                type="button"
-                title="放大"
-                :disabled="canvasZoom >= 8"
-                @click="zoomCanvasIn"
-              >
-                <Icon icon="ri:zoom-in-line" class="h-4 w-4" />
-              </button>
-              <button
-                class="rounded-md p-2 text-ink-600 transition hover:bg-ink-100 disabled:opacity-40 dark:text-ink-300 dark:hover:bg-white/10"
-                type="button"
-                title="撤销"
-                :disabled="undoStack.length === 0"
-                @click="undo"
-              >
-                <Icon icon="ri:arrow-go-back-line" class="h-4 w-4" />
-              </button>
-              <button
-                class="rounded-md p-2 text-ink-600 transition hover:bg-ink-100 disabled:opacity-40 dark:text-ink-300 dark:hover:bg-white/10"
-                type="button"
-                title="重做"
-                :disabled="redoStack.length === 0"
-                @click="redo"
-              >
-                <Icon icon="ri:arrow-go-forward-line" class="h-4 w-4" />
-              </button>
-              <button
-                v-for="tool in editorTools"
-                :key="tool.id"
-                class="rounded-md p-2 transition"
-                :class="
-                  !isActualEffectPreview && activeTool === tool.id
-                    ? 'bg-ink-900 text-white dark:bg-ink-50 dark:text-ink-900'
-                    : 'text-ink-600 hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10'
-                "
-                type="button"
-                :title="tool.label"
-                @click="patternPreviewMode = 'chart'; activeTool = tool.id"
-              >
-                <Icon :icon="tool.icon" class="h-4 w-4" />
-              </button>
-              <button
-                class="rounded-md p-2 transition"
-                :class="
-                  isActualEffectPreview
-                    ? 'bg-ink-900 text-white dark:bg-ink-50 dark:text-ink-900'
-                    : 'text-ink-600 hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10'
-                "
-                type="button"
-                :title="isActualEffectPreview ? '返回编辑图纸' : '预览实际效果图'"
-                @click="patternPreviewMode = isActualEffectPreview ? 'chart' : 'effect'"
-              >
-                <Icon :icon="isActualEffectPreview ? 'ri:grid-line' : 'ri:eye-line'" class="h-4 w-4" />
-              </button>
-              <button
-                class="rounded-md p-2 text-ink-600 transition hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10"
-                type="button"
-                :title="isPatternFullscreen ? '退出全屏' : '全屏预览'"
-                @click="togglePatternFullscreen"
-              >
-                <Icon :icon="isPatternFullscreen ? 'ri:fullscreen-exit-line' : 'ri:fullscreen-line'" class="h-4 w-4" />
-              </button>
-            </div>
-          </div>
+          <PatternPreviewToolbar
+            :canvas-zoom="canvasZoom"
+            :canvas-zoom-percent="canvasZoomPercent"
+            :undo-count="undoStack.length"
+            :redo-count="redoStack.length"
+            :editor-tools="editorTools"
+            :active-tool="activeTool"
+            :is-actual-effect-preview="isActualEffectPreview"
+            :is-pattern-fullscreen="isPatternFullscreen"
+            @zoom-out="zoomCanvasOut"
+            @reset-viewport="resetCanvasViewport"
+            @zoom-in="zoomCanvasIn"
+            @undo="undo"
+            @redo="redo"
+            @select-tool="selectEditorTool"
+            @toggle-preview-mode="patternPreviewMode = isActualEffectPreview ? 'chart' : 'effect'"
+            @toggle-fullscreen="togglePatternFullscreen"
+          />
 
           <div
             ref="patternCanvasStage"
-            class="pattern-canvas-stage flex min-h-0 flex-1 touch-none select-none items-center justify-center overflow-hidden bg-ink-50 p-5 dark:bg-ink-900"
+            class="pattern-canvas-stage relative flex min-h-0 flex-1 touch-none select-none items-center justify-center overflow-hidden bg-ink-50 p-5 dark:bg-ink-900"
             :class="canvasCursorClass"
             @wheel="onCanvasWheel"
             @pointerdown="onCanvasPointerDown"
@@ -2532,139 +2773,37 @@ onBeforeUnmount(() => {
                 ></canvas>
               </div>
             </div>
+
+            <ShortcutHelpPopover
+              v-model:is-open="isShortcutHelpOpen"
+              :shortcut-groups="shortcutGroups"
+            />
           </div>
 
-          <div class="border-t border-ink-100 px-4 py-3 dark:border-white/10">
-            <div class="flex min-w-0 items-center gap-3">
-              <div class="relative flex shrink-0 items-center gap-2">
-                <Icon icon="ri:palette-line" class="h-4 w-4 text-bead-violet" />
-                <span class="text-xs font-semibold text-ink-600 dark:text-ink-300">当前用色</span>
-                <button
-                  class="inline-flex h-9 max-w-44 items-center gap-2 rounded-md border border-ink-200 bg-white px-2.5 text-left text-xs transition hover:border-ink-300 hover:bg-ink-50 dark:border-white/10 dark:bg-ink-800 dark:hover:bg-white/5"
-                  :class="isPalettePickerOpen ? 'border-bead-violet ring-2 ring-bead-violet/20' : ''"
-                  type="button"
-                  :title="`从 ${activeManufacturerPalette.name} 色卡选择颜色`"
-                  @click.stop="isPalettePickerOpen = !isPalettePickerOpen"
-                >
-                  <span
-                    class="h-5 w-5 shrink-0 rounded border border-ink-200 dark:border-white/10"
-                    :style="{ backgroundColor: selectedColorHex }"
-                  ></span>
-                  <span class="min-w-0">
-                    <span class="block truncate font-semibold text-ink-800 dark:text-ink-100">{{ selectedColor.id }}</span>
-                    <span class="block truncate text-[10px] text-ink-500 dark:text-ink-400">{{ selectedColor.name }}</span>
-                  </span>
-                  <Icon icon="ri:arrow-down-s-line" class="h-4 w-4 shrink-0 text-ink-500 dark:text-ink-400" />
-                </button>
+          <CurrentColorBar
+            v-model:is-palette-picker-open="isPalettePickerOpen"
+            v-model:palette-search-query="paletteSearchQuery"
+            :selected-color-hex="selectedColorHex"
+            :selected-color-id="selectedColor.id"
+            :selected-color-name="selectedColor.name"
+            :selected-color-label="selectedColorLabel"
+            :manufacturer-name="activeManufacturerPalette.name"
+            :filtered-palette-colors="filteredPaletteColors"
+            :active-palette-color-count="activePaletteColors.length"
+            :used-color-counts="usedColorCounts"
+            :displayed-colors="displayedColors"
+            @select-color="selectPaletteColor"
+          />
 
-                <div
-                  v-if="isPalettePickerOpen"
-                  class="absolute bottom-11 left-0 z-30 w-[min(34rem,calc(100vw-2rem))] rounded-md border border-ink-100 bg-white shadow-panel dark:border-white/10 dark:bg-ink-800"
-                  @click.stop
-                >
-                  <div class="flex items-center gap-2 border-b border-ink-100 p-3 dark:border-white/10">
-                    <Icon icon="ri:search-line" class="h-4 w-4 shrink-0 text-ink-500 dark:text-ink-400" />
-                    <input
-                      v-model="paletteSearchQuery"
-                      class="h-9 min-w-0 flex-1 rounded-md border border-ink-100 bg-ink-50 px-3 text-sm outline-none transition focus:border-bead-violet dark:border-white/10 dark:bg-ink-900"
-                      type="search"
-                      placeholder="搜索编号、名称或 HEX"
-                    />
-                    <button
-                      class="rounded-md p-2 text-ink-500 transition hover:bg-ink-100 dark:text-ink-300 dark:hover:bg-white/10"
-                      type="button"
-                      title="关闭色卡"
-                      @click="isPalettePickerOpen = false"
-                    >
-                      <Icon icon="ri:close-line" class="h-4 w-4" />
-                    </button>
-                  </div>
-
-                  <div class="flex items-center justify-between gap-3 px-3 py-2 text-xs text-ink-500 dark:text-ink-400">
-                    <span class="truncate">{{ activeManufacturerPalette.name }} · {{ filteredPaletteColors.length }} / {{ activePaletteColors.length }} 色</span>
-                    <span class="shrink-0 truncate">{{ selectedColorLabel }}</span>
-                  </div>
-
-                  <div class="tool-scroll grid max-h-80 grid-cols-[repeat(auto-fill,minmax(4.75rem,1fr))] gap-2 overflow-y-auto px-3 pb-3">
-                    <button
-                      v-for="color in filteredPaletteColors"
-                      :key="color.id"
-                      type="button"
-                      class="min-h-20 rounded-md border p-2 text-left text-[11px] transition hover:border-ink-300 hover:bg-ink-50 dark:border-white/10 dark:hover:bg-white/5"
-                      :class="
-                        selectedColorHex === color.hex
-                          ? 'border-bead-coral bg-bead-coral/10 ring-2 ring-bead-coral/20'
-                          : 'border-ink-100'
-                      "
-                      :title="`${color.id} ${color.name} ${color.hex}`"
-                      @click="selectPaletteColor(color.hex)"
-                    >
-                      <span class="block h-7 rounded border border-ink-100 dark:border-white/10" :style="{ backgroundColor: color.hex }"></span>
-                      <span class="mt-1 block truncate font-semibold text-ink-800 dark:text-ink-100">{{ color.id }}</span>
-                      <span class="block truncate text-ink-500 dark:text-ink-400">{{ color.name }}</span>
-                      <span v-if="usedColorCounts.get(color.hex)" class="mt-1 block text-[10px] text-bead-violet">
-                        已用 {{ usedColorCounts.get(color.hex) }}
-                      </span>
-                    </button>
-                  </div>
-
-                  <div v-if="filteredPaletteColors.length === 0" class="px-3 pb-3 text-sm text-ink-500 dark:text-ink-400">
-                    没有匹配的颜色
-                  </div>
-                </div>
-              </div>
-              <div class="tool-scroll flex min-w-0 flex-1 gap-2 overflow-x-auto pb-1">
-                <button
-                  v-for="color in displayedColors"
-                  :key="color.id"
-                  type="button"
-                  class="grid h-14 min-w-24 grid-cols-[2rem_minmax(0,1fr)] items-center gap-2 rounded-md border px-2 text-left text-[11px] transition hover:border-ink-300 dark:border-white/10"
-                  :class="
-                    selectedColorHex === color.hex
-                      ? 'border-bead-coral bg-bead-coral/10'
-                      : 'border-ink-100'
-                  "
-                  :title="`${color.id} ${color.name}`"
-                  @click="selectPaletteColor(color.hex)"
-                >
-                  <span class="h-8 w-8 rounded border border-ink-100 dark:border-white/10" :style="{ backgroundColor: color.hex }"></span>
-                  <span class="min-w-0">
-                    <span class="block truncate font-semibold">{{ color.id }}</span>
-                    <span class="block truncate text-ink-500 dark:text-ink-400">{{ color.count }}</span>
-                  </span>
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <div
-            class="grid grid-cols-6 gap-3 border-t border-ink-100 px-4 py-3 text-sm dark:border-white/10"
-          >
-            <div>
-              <span class="block text-xs text-ink-500 dark:text-ink-400">格子</span>
-              <strong>{{ previewColumns * previewRows }}</strong>
-            </div>
-            <div>
-              <span class="block text-xs text-ink-500 dark:text-ink-400">颜色</span>
-              <strong>{{ actualUsedColorCount }}</strong>
-            </div>
-            <div>
-              <span class="block text-xs text-ink-500 dark:text-ink-400">工具</span>
-              <strong>{{ activeToolLabel }}</strong>
-            </div>
-            <div>
-              <span class="block text-xs text-ink-500 dark:text-ink-400">状态</span>
-              <strong>{{ patternStatus }}</strong>
-            </div>
-            <div>
-              <span class="block text-xs text-ink-500 dark:text-ink-400">标号</span>
-              <strong>{{ showGridLabels ? '显示' : '隐藏' }}</strong>
-            </div>
-            <div>
-              <span class="block text-xs text-ink-500 dark:text-ink-400">清理</span>
-              <strong>{{ isAiOptimizeMode ? '不参与' : enablePixelCleanup ? '开启' : '关闭' }}</strong>
-            </div>
-          </div>
+          <PatternPreviewStatusBar
+            :total-cells="previewColumns * previewRows"
+            :color-count="actualUsedColorCount"
+            :active-tool-label="activeToolLabel"
+            :pattern-status="patternStatus"
+            :input-mode-label="selectedPatternInputMode.label"
+            :dithering-status-label="ditheringStatusLabel"
+            :cleanup-status-label="cleanupStatusLabel"
+          />
         </section>
 
         <section
@@ -2678,119 +2817,26 @@ onBeforeUnmount(() => {
           </div>
 
           <form class="space-y-4" @submit.prevent>
-            <div class="space-y-2">
-              <span class="text-xs font-medium text-ink-600 dark:text-ink-300">生成方式</span>
-              <div class="grid grid-cols-2 gap-1 rounded-md border border-ink-200 bg-ink-100 p-1 dark:border-white/10 dark:bg-ink-900">
-                <button
-                  v-for="mode in aiCreationModes"
-                  :key="mode.id"
-                  class="rounded px-3 py-2 text-sm font-semibold transition hover:brightness-105"
-                  :style="
-                    aiCreationMode === mode.id
-                      ? {
-                          backgroundColor: resolvedTheme === 'dark' ? '#f8f7f4' : '#ffffff',
-                          color: '#191715',
-                          boxShadow: '0 1px 2px rgb(25 23 21 / 0.16)'
-                        }
-                      : {
-                          backgroundColor: resolvedTheme === 'dark' ? '#191715' : 'transparent',
-                          color: resolvedTheme === 'dark' ? '#ece8df' : '#63594d'
-                        }
-                  "
-                  type="button"
-                  @click="aiCreationMode = mode.id"
-                >
-                  {{ mode.label }}
-                </button>
-              </div>
-              <span class="block text-[11px] text-ink-500 dark:text-ink-400">
-                {{ aiCreationModes.find((mode) => mode.id === aiCreationMode)?.description }}
-              </span>
-            </div>
+            <AiCreationModeSelector
+              v-model:ai-creation-mode="aiCreationMode"
+              :ai-creation-modes="aiCreationModes"
+              :resolved-theme="resolvedTheme"
+            />
 
 
-            <label
-              class="group flex min-h-32 cursor-pointer flex-col justify-center rounded-md border border-dashed border-ink-200 bg-ink-50 p-3 text-center transition hover:border-bead-sky hover:bg-bead-sky/5 dark:border-white/10 dark:bg-ink-900 dark:hover:bg-bead-sky/10"
-              title="上传 AI 参考图片"
-            >
-              <template v-if="sourcePreviewDataUrl">
-                <div class="flex w-full items-center gap-3 text-left">
-                  <div class="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded border border-ink-100 bg-white dark:border-white/10 dark:bg-ink-800">
-                    <img
-                      class="h-full w-full object-contain"
-                      :src="sourcePreviewDataUrl"
-                      :alt="sourceFile?.name || '原图预览'"
-                    />
-                  </div>
-                  <div class="min-w-0 flex-1">
-                    <span class="flex items-center gap-1.5 text-xs font-semibold text-ink-800 dark:text-ink-100">
-                      <Icon icon="ri:image-edit-line" class="h-3.5 w-3.5 text-bead-sky" />
-                      原图预览 · 点击更换
-                    </span>
-                    <span class="mt-1 block max-w-full truncate text-xs text-ink-500 dark:text-ink-400">
-                      {{ sourceFile?.name }}
-                    </span>
-                    <span class="mt-2 inline-flex items-center rounded bg-bead-sky/10 px-2 py-1 text-[11px] font-semibold text-bead-sky">
-                      缩略图
-                    </span>
-                  </div>
-                </div>
-              </template>
-              <template v-else>
-                <div class="flex min-h-28 flex-col items-center justify-center px-3 py-4">
-                  <Icon icon="ri:image-add-line" class="h-8 w-8 text-bead-sky" />
-                  <span class="mt-2 text-sm font-semibold text-ink-800 dark:text-ink-100">
-                    {{ sourceFile ? '更换图片' : '上传图片' }}
-                  </span>
-                  <span class="mt-1 block max-w-full truncate text-xs text-ink-500 dark:text-ink-400">
-                    {{ sourceFile?.name || patternGrid.sourceName }}
-                  </span>
-                </div>
-              </template>
-              <input class="hidden" type="file" accept="image/*" @change="onAiImageSelected" />
-            </label>
-
-            <div
-              v-if="isAiOptimizeMode"
-              class="rounded-md border border-ink-100 bg-ink-50 p-3 dark:border-white/10 dark:bg-ink-900"
-            >
-              <div class="mb-3 flex items-center justify-between gap-2">
-                <div>
-                  <h4 class="text-xs font-semibold text-ink-700 dark:text-ink-100">AI 服务</h4>
-                  <p class="mt-0.5 text-[11px] text-ink-500 dark:text-ink-400">选择 API 厂商和生图模型</p>
-                </div>
-                <button
-                  class="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-ink-200 px-2.5 py-1.5 text-xs font-semibold text-ink-700 transition hover:bg-white dark:border-white/10 dark:text-ink-100 dark:hover:bg-white/10"
-                  type="button"
-                  title="配置 API 厂商"
-                  @click="isAiSettingsOpen = true"
-                >
-                  <Icon icon="ri:settings-4-line" class="h-3.5 w-3.5" />
-                  <span>配置</span>
-                </button>
-              </div>
-
-              <label class="block space-y-1.5">
-                <span class="block text-xs font-medium text-ink-600 dark:text-ink-300">API 厂商</span>
-                <select
-                  v-model="selectedProviderId"
-                  class="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm font-semibold text-ink-800 outline-none transition focus:border-bead-sky dark:border-white/10 dark:bg-ink-900 dark:text-ink-100"
-                  @change="onProviderChange"
-                >
-                  <option :value="NEW_PROVIDER_ID" disabled>
-                    {{ aiProviderOptions.length === 0 ? '请先配置 API 厂商' : '请选择 API 厂商' }}
-                  </option>
-                  <option v-for="provider in aiProviderOptions" :key="provider.id" :value="provider.id">
-                    {{ provider.name }}
-                  </option>
-                </select>
-              </label>
-
-              <div class="mt-3 rounded-md border border-ink-100 bg-white px-3 py-2 text-xs dark:border-white/10 dark:bg-ink-800">
-                <span class="block text-ink-500 dark:text-ink-400">模型</span>
-                <strong class="mt-1 block truncate text-ink-800 dark:text-ink-100">{{ selectedModel || '未选择' }}</strong>
-              </div>
-            </div>
+            <GenerationSourcePanel
+              v-model:selected-provider-id="selectedProviderId"
+              :source-preview-data-url="sourcePreviewDataUrl"
+              :source-file-name="sourceFile?.name || ''"
+              :pattern-source-name="patternGrid.sourceName"
+              :is-ai-optimize-mode="isAiOptimizeMode"
+              :new-provider-id="NEW_PROVIDER_ID"
+              :ai-provider-options="aiProviderOptions"
+              :selected-model="selectedModel"
+              @image-selected="onAiImageSelected"
+              @open-ai-settings="isAiSettingsOpen = true"
+              @provider-change="onProviderChange"
+            />
 
             <label v-if="isAiOptimizeMode" class="block space-y-1.5">
               <span class="text-xs font-medium text-ink-600 dark:text-ink-300">提示词</span>
@@ -2842,62 +2888,15 @@ onBeforeUnmount(() => {
               </label>
             </template>
 
-            <div
+            <AiOptimizeResultPanel
               v-if="isAiOptimizeMode"
-              class="overflow-hidden rounded-md border border-ink-100 bg-ink-50 dark:border-white/10 dark:bg-ink-900"
-            >
-              <div
-                v-if="isOptimizingImage"
-                class="flex min-h-36 flex-col items-center justify-center gap-3 px-3 py-5 text-center"
-              >
-                <span class="relative inline-flex h-10 w-10 items-center justify-center">
-                  <span class="absolute h-full w-full animate-ping rounded-full bg-bead-sky/25"></span>
-                  <Icon icon="ri:loader-4-line" class="relative h-6 w-6 animate-spin text-bead-sky" />
-                </span>
-                <div>
-                  <strong class="block text-sm">AI 正在优化原图</strong>
-                  <span class="mt-1 block text-xs text-ink-500 dark:text-ink-400">
-                    已等待 {{ aiOptimizeElapsedLabel }}
-                  </span>
-                </div>
-              </div>
-              <div
-                v-else-if="aiOptimizeError"
-                class="min-h-28 px-3 py-4 text-sm"
-              >
-                <div class="flex items-start gap-2 rounded-md border border-bead-coral/30 bg-bead-coral/10 px-3 py-2 text-bead-coral">
-                  <Icon icon="ri:error-warning-line" class="mt-0.5 h-4 w-4 shrink-0" />
-                  <div class="min-w-0">
-                    <strong class="block">AI 优化失败</strong>
-                    <span class="mt-1 block break-words text-xs">{{ aiOptimizeError }}</span>
-                    <span class="mt-1 block text-xs">耗时 {{ aiOptimizeElapsedLabel }}</span>
-                  </div>
-                </div>
-              </div>
-              <div
-                v-else-if="aiReferenceDataUrl"
-                class="space-y-2 p-3"
-              >
-                <div class="overflow-hidden rounded-md border border-ink-100 bg-white dark:border-white/10 dark:bg-ink-800">
-                  <img
-                    class="max-h-48 w-full object-contain"
-                    :src="aiReferenceDataUrl"
-                    :alt="aiReferenceName || 'AI 优化结果'"
-                  />
-                </div>
-                <div class="rounded-md border border-bead-mint/30 bg-bead-mint/10 px-3 py-2 text-xs text-ink-700 dark:text-ink-100">
-                  <strong class="block">{{ aiOptimizeStatus || 'AI 优化完成' }}</strong>
-                  <span class="mt-1 block text-ink-500 dark:text-ink-400">耗时 {{ aiOptimizeElapsedLabel }}</span>
-                </div>
-              </div>
-              <div
-                v-else
-                class="flex min-h-28 flex-col items-center justify-center px-3 py-5 text-center text-xs text-ink-500 dark:text-ink-400"
-              >
-                <Icon icon="ri:image-edit-line" class="mb-2 h-6 w-6 text-bead-sky" />
-                <span>AI 优化结果将在这里显示</span>
-              </div>
-            </div>
+              :is-optimizing-image="isOptimizingImage"
+              :ai-optimize-error="aiOptimizeError"
+              :ai-optimize-status="aiOptimizeStatus"
+              :ai-optimize-elapsed-label="aiOptimizeElapsedLabel"
+              :ai-reference-data-url="aiReferenceDataUrl"
+              :ai-reference-name="aiReferenceName"
+            />
 
             <p
               v-if="!isAiOptimizeMode && (aiOptimizeStatus || aiOptimizeError)"
@@ -2916,275 +2915,71 @@ onBeforeUnmount(() => {
       </div>
     </main>
 
-    <div
-      v-if="isAiSettingsOpen"
-      class="fixed inset-0 z-40 flex items-center justify-center bg-ink-900/45 p-4"
-    >
-      <section
-        class="flex max-h-[min(50rem,calc(100vh-2rem))] w-full max-w-6xl flex-col rounded-xl border border-ink-100 bg-ink-50 shadow-panel dark:border-white/10 dark:bg-ink-900"
-      >
-        <div class="flex items-start justify-between gap-3 px-6 py-5">
-          <div class="min-w-0">
-            <div class="flex min-w-0 items-center gap-2">
-              <Icon icon="ri:settings-4-line" class="h-5 w-5 text-bead-sky" />
-              <h3 class="truncate text-xl font-black tracking-tight">API 设置</h3>
-            </div>
-            <p class="mt-1 text-xs font-medium text-ink-500 dark:text-ink-400">
-              {{ apiSettingsDescription }}
-            </p>
-          </div>
-          <button
-            class="rounded-md p-2 text-ink-500 transition hover:bg-white dark:text-ink-300 dark:hover:bg-white/10"
-            type="button"
-            title="关闭"
-            @click="isAiSettingsOpen = false"
-          >
-            <Icon icon="ri:close-line" class="h-4 w-4" />
-          </button>
-        </div>
+    <AiProviderSettingsModal
+      v-model:provider-name="providerName"
+      v-model:base-url="baseUrl"
+      v-model:api-key="apiKey"
+      v-model:selected-model="selectedModel"
+      :is-open="isAiSettingsOpen"
+      :api-settings-description="apiSettingsDescription"
+      :ai-provider-options="aiProviderOptions"
+      :selected-provider-id="selectedProviderId"
+      :selected-provider="selectedProvider"
+      :selected-provider-has-stored-key="selectedProviderHasStoredKey"
+      :api-key-storage-hint="apiKeyStorageHint"
+      :provider-notice-message="providerNoticeMessage"
+      :provider-notice-is-error="providerNoticeIsError"
+      :is-deleting-provider="isDeletingProvider"
+      :is-saving-provider="isSavingProvider"
+      :model-options="modelOptions"
+      :is-fetching-models="isFetchingModels"
+      :model-status="modelStatus"
+      :model-error="modelError"
+      @close="isAiSettingsOpen = false"
+      @select-provider="
+        (id) => {
+          selectedProviderId = id;
+          onProviderChange()
+        }
+      "
+      @reset-provider-form="resetProviderForm"
+      @delete-provider-profile="deleteProviderProfile"
+      @save-provider-profile="saveProviderProfile"
+      @fetch-models="fetchModels"
+    />
 
-        <form class="tool-scroll grid min-h-0 gap-4 overflow-auto px-6 pb-6 lg:grid-cols-[17rem_minmax(0,1fr)]" @submit.prevent>
-          <input
-            autocomplete="username"
-            class="hidden"
-            tabindex="-1"
-            type="text"
-            value="ai-provider"
-          />
-
-          <aside
-            class="rounded-xl border border-ink-100 bg-white p-3 shadow-sm dark:border-white/10 dark:bg-ink-800"
-          >
-            <div class="mb-3 px-2 text-xs font-semibold text-ink-500 dark:text-ink-400">平台列表</div>
-            <div class="space-y-2">
-              <button
-                v-for="provider in aiProviderOptions"
-                :key="provider.id"
-                type="button"
-                class="flex w-full items-center gap-3 rounded-lg px-3 py-3 text-left transition"
-                :class="
-                  selectedProviderId === provider.id
-                    ? 'bg-ink-100 text-ink-900 dark:bg-white/10 dark:text-white'
-                    : 'text-ink-600 hover:bg-ink-50 dark:text-ink-300 dark:hover:bg-white/5'
-                "
-                @click="
-                  selectedProviderId = provider.id;
-                  onProviderChange()
-                "
-              >
-                <span
-                  class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-ink-50 dark:bg-ink-900"
-                >
-                  <Icon :icon="provider.isSavedProfile ? 'ri:key-2-line' : 'ri:apps-2-line'" class="h-4 w-4" />
-                </span>
-                <span class="min-w-0 flex-1">
-                  <span class="block truncate text-sm font-bold">{{ provider.name }}</span>
-                  <span class="block truncate text-[11px] text-ink-500 dark:text-ink-400">
-                    {{ provider.baseUrl }}
-                  </span>
-                </span>
-                <span
-                  class="rounded-full bg-ink-50 px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-ink-500 dark:bg-ink-900 dark:text-ink-400"
-                >
-                  Saved
-                </span>
-              </button>
-              <div
-                v-if="aiProviderOptions.length === 0"
-                class="rounded-lg border border-dashed border-ink-200 px-3 py-8 text-center text-xs font-semibold text-ink-400 dark:border-white/10"
-              >
-                暂无已保存平台
-              </div>
-            </div>
-
-            <div class="mt-4 border-t border-ink-100 pt-4 dark:border-white/10">
-              <button
-                class="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-ink-200 px-3 py-2.5 text-sm font-semibold text-ink-600 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-300 dark:hover:bg-white/5"
-                type="button"
-                @click="resetProviderForm"
-              >
-                <Icon icon="ri:add-line" class="h-4 w-4" />
-                <span>新增平台</span>
-              </button>
-            </div>
-          </aside>
-
-          <div class="min-w-0 space-y-4">
-            <div
-              class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-ink-100 bg-white p-5 shadow-sm dark:border-white/10 dark:bg-ink-800"
-            >
-              <div class="min-w-0">
-                <h4 class="truncate text-2xl font-black tracking-tight">{{ providerName || selectedProvider.name }}</h4>
-                <p class="mt-1 text-xs font-semibold text-ink-500 dark:text-ink-400">
-                  配置基础信息、API Key 和可用生图模型
-                </p>
-              </div>
-              <div class="flex shrink-0 gap-2">
-                <button
-                  class="inline-flex items-center justify-center gap-2 rounded-lg border border-ink-200 px-3 py-2 text-sm font-semibold text-ink-700 transition hover:bg-ink-50 disabled:opacity-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-                  type="button"
-                  title="删除供应商档案"
-                  :disabled="!selectedProvider.isSavedProfile || isDeletingProvider"
-                  @click="deleteProviderProfile"
-                >
-                  <Icon icon="ri:delete-bin-line" class="h-4 w-4" :class="isDeletingProvider ? 'animate-spin' : ''" />
-                  <span>删除</span>
-                </button>
-                <button
-                  class="inline-flex items-center justify-center gap-2 rounded-lg bg-ink-800 px-4 py-2 text-sm font-semibold text-white transition hover:bg-ink-700 disabled:opacity-50 dark:bg-white dark:text-ink-900"
-                  type="button"
-                  title="保存供应商档案"
-                  :disabled="isSavingProvider"
-                  @click="saveProviderProfile"
-                >
-                  <Icon icon="ri:save-3-line" class="h-4 w-4" :class="isSavingProvider ? 'animate-spin' : ''" />
-                  <span>保存</span>
-                </button>
-              </div>
-            </div>
-
-            <div
-              class="rounded-xl border border-ink-100 bg-white p-5 shadow-sm dark:border-white/10 dark:bg-ink-800"
-            >
-              <div class="mb-4 border-b border-ink-100 pb-3 dark:border-white/10">
-                <h5 class="text-sm font-bold">基本信息</h5>
-                <p class="mt-1 text-xs font-medium text-ink-500 dark:text-ink-400">
-                  平台显示名、请求地址和 API Key
-                </p>
-              </div>
-
-              <div class="space-y-4">
-                <label class="block space-y-1.5">
-                  <span class="text-xs font-semibold text-ink-600 dark:text-ink-300">平台名称</span>
-                  <input
-                    v-model="providerName"
-                    class="w-full rounded-lg border border-ink-200 bg-ink-50 px-3 py-3 text-sm font-semibold outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
-                    type="text"
-                  />
-                  <span class="text-[11px] font-medium text-ink-500 dark:text-ink-400">
-                    平台 ID: {{ selectedProviderId }}
-                  </span>
-                </label>
-
-                <label class="block space-y-1.5">
-                  <span class="text-xs font-semibold text-ink-600 dark:text-ink-300">请求地址</span>
-                  <input
-                    v-model="baseUrl"
-                    class="w-full rounded-lg border border-ink-200 bg-ink-50 px-3 py-3 text-sm font-semibold outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
-                    type="url"
-                  />
-                </label>
-
-                <label class="block space-y-1.5">
-                  <span class="text-xs font-semibold text-ink-600 dark:text-ink-300">API Key</span>
-                  <div class="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
-                    <input
-                      v-model="apiKey"
-                      class="w-full rounded-lg border border-ink-200 bg-ink-50 px-3 py-3 text-sm font-semibold outline-none focus:border-bead-sky dark:border-white/10 dark:bg-ink-900"
-                      autocomplete="new-password"
-                      :placeholder="selectedProviderHasStoredKey ? '保持当前 Key ********' : 'sk-...'"
-                      type="password"
-                    />
-                    <button
-                      class="inline-flex items-center justify-center gap-2 rounded-lg border border-ink-200 px-4 py-3 text-sm font-semibold text-ink-700 transition hover:bg-ink-50 dark:border-white/10 dark:text-ink-200 dark:hover:bg-white/5"
-                      type="button"
-                      title="保存供应商档案"
-                      :disabled="isSavingProvider"
-                      @click="saveProviderProfile"
-                    >
-                      <Icon icon="ri:check-line" class="h-4 w-4" />
-                    </button>
-                  </div>
-                  <span class="text-[11px] font-medium text-ink-500 dark:text-ink-400">
-                    {{ apiKeyStorageHint }}
-                  </span>
-                </label>
-              </div>
-            </div>
-
-            <p
-              v-if="providerNoticeMessage"
-              class="rounded-lg border px-3 py-2 text-xs"
-              :class="
-                providerNoticeIsError
-                  ? 'border-bead-coral/30 bg-bead-coral/10 text-bead-coral'
-                  : 'border-bead-sky/30 bg-bead-sky/10 text-ink-700 dark:text-ink-100'
-              "
-            >
-              {{ providerNoticeMessage }}
-            </p>
-
-            <div
-              class="rounded-xl border border-ink-100 bg-white p-5 shadow-sm dark:border-white/10 dark:bg-ink-800"
-            >
-              <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h5 class="text-sm font-bold">模型列表</h5>
-                  <p class="mt-1 text-xs font-medium text-ink-500 dark:text-ink-400">
-                    从上游 API 拉取后仅展示可识别的生图模型
-                  </p>
-                </div>
-                <button
-                  class="inline-flex items-center justify-center gap-2 rounded-lg bg-ink-800 px-4 py-2 text-sm font-semibold text-white transition hover:bg-ink-700 disabled:opacity-50 dark:bg-white dark:text-ink-900"
-                  type="button"
-                  title="拉取模型"
-                  :disabled="isFetchingModels"
-                  @click="fetchModels"
-                >
-                  <Icon
-                    icon="ri:refresh-line"
-                    class="h-4 w-4"
-                    :class="isFetchingModels ? 'animate-spin' : ''"
-                  />
-                  <span>{{ isFetchingModels ? '拉取中' : '拉取模型' }}</span>
-                </button>
-              </div>
-
-              <div class="space-y-2">
-                <label
-                  v-for="model in modelOptions"
-                  :key="model"
-                  class="flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-3 transition"
-                  :class="
-                    selectedModel === model
-                      ? 'border-bead-sky bg-bead-sky/10'
-                      : 'border-ink-100 bg-ink-50 hover:border-ink-200 dark:border-white/10 dark:bg-ink-900 dark:hover:border-white/20'
-                  "
-                >
-                  <input v-model="selectedModel" class="sr-only" name="ai-image-model" type="radio" :value="model" />
-                  <Icon icon="ri:image-line" class="h-4 w-4 text-bead-sky" />
-                  <span class="min-w-0 flex-1 truncate text-sm font-semibold">{{ model }}</span>
-                  <Icon
-                    v-if="selectedModel === model"
-                    icon="ri:check-line"
-                    class="h-4 w-4 text-bead-sky"
-                  />
-                </label>
-
-                <div
-                  v-if="modelOptions.length === 0"
-                  class="rounded-lg border border-dashed border-ink-200 px-3 py-6 text-center text-sm font-semibold text-ink-400 dark:border-white/10"
-                >
-                  暂无生图模型
-                </div>
-              </div>
-
-              <p
-                v-if="modelStatus || modelError"
-                class="mt-3 rounded-lg border px-3 py-2 text-xs"
-                :class="
-                  modelError
-                    ? 'border-bead-coral/30 bg-bead-coral/10 text-bead-coral'
-                    : 'border-bead-mint/30 bg-bead-mint/10 text-ink-700 dark:text-ink-100'
-                "
-              >
-                {{ modelError || modelStatus }}
-              </p>
-            </div>
-          </div>
-
-        </form>
-      </section>
-    </div>
+    <PixelArtCalibrationModal
+      :is-open="isPixelArtCalibrationOpen"
+      :source-preview-data-url="sourcePreviewDataUrl"
+      :board-style="pixelArtCalibrationBoardStyle"
+      :image-style="pixelArtCalibrationModalImageStyle"
+      :grid-style="pixelArtCalibrationModalGridStyle"
+      :draft-label="pixelArtCalibrationDraftLabel"
+      :draft-scale="pixelArtDraftScale"
+      :draft-offset-x="pixelArtDraftOffsetX"
+      :draft-offset-y="pixelArtDraftOffsetY"
+      :original-scale="pixelArtScale"
+      :original-offset-x="pixelArtOffsetX"
+      :original-offset-y="pixelArtOffsetY"
+      @close="closePixelArtCalibration"
+      @pointer-down="onPixelArtCalibrationPointerDown"
+      @pointer-move="onPixelArtCalibrationPointerMove"
+      @pointer-up="onPixelArtCalibrationPointerUp"
+      @wheel="onPixelArtCalibrationWheel"
+      @adjust-scale="adjustPixelArtDraftScale"
+      @update-draft-scale="(value) => { pixelArtDraftScale = value }"
+      @update-draft-offset-x="(value) => { pixelArtDraftOffsetX = value }"
+      @update-draft-offset-y="(value) => { pixelArtDraftOffsetY = value }"
+      @nudge="nudgePixelArtDraftCalibration"
+      @reset="resetPixelArtDraftCalibration"
+      @revert="
+        () => {
+          pixelArtDraftScale = pixelArtScale;
+          pixelArtDraftOffsetX = pixelArtOffsetX;
+          pixelArtDraftOffsetY = pixelArtOffsetY
+        }
+      "
+      @apply="applyPixelArtCalibration"
+    />
   </div>
 </template>
