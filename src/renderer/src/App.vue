@@ -1028,6 +1028,7 @@ const getPatternGenerationOptions = () => ({
 
 const MIN_CANVAS_ZOOM = 0.5
 const MAX_CANVAS_ZOOM = 8
+const MAX_CANVAS_BACKING_PIXELS = 6144
 const CANVAS_ZOOM_STEP = 1.25
 const CANVAS_DRAG_THRESHOLD = 3
 const CANVAS_MIN_VISIBLE_SIZE = 48
@@ -1298,8 +1299,13 @@ const drawPatternCanvas = (): void => {
   if (!canvas || !frame) return
 
   const cssSize = Math.max(1, Math.floor(Math.min(frame.clientWidth, frame.clientHeight)))
-  const pixelRatio = Math.max(1, window.devicePixelRatio || 1)
-  const pixelSize = Math.floor(cssSize * pixelRatio)
+  const devicePixelRatio = Math.max(1, window.devicePixelRatio || 1)
+  const zoomRenderRatio = Math.max(1, canvasZoom.value)
+  const backingScale = Math.max(
+    1,
+    Math.min(devicePixelRatio * zoomRenderRatio, MAX_CANVAS_BACKING_PIXELS / cssSize)
+  )
+  const pixelSize = Math.max(1, Math.floor(cssSize * backingScale))
 
   if (canvas.width !== pixelSize || canvas.height !== pixelSize) {
     canvas.width = pixelSize
@@ -1311,7 +1317,7 @@ const drawPatternCanvas = (): void => {
   const context = canvas.getContext('2d')
   if (!context) return
 
-  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
+  context.setTransform(backingScale, 0, 0, backingScale, 0, 0)
   context.clearRect(0, 0, cssSize, cssSize)
 
   const isDark = resolvedTheme.value === 'dark'
@@ -2608,7 +2614,7 @@ watch([patternGrid, showGridLabels, resolvedTheme, patternPreviewMode], () => {
   void nextTick(schedulePatternCanvasDraw)
 }, { deep: true })
 
-watch(canvasBaseSize, () => {
+watch([canvasBaseSize, canvasZoom], () => {
   void nextTick(schedulePatternCanvasDraw)
 })
 
